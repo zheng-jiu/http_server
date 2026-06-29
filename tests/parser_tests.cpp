@@ -5,10 +5,8 @@
 #include <cassert>
 #include <iostream>
 
-using namespace tiny_http;
-
 int main() {
-    HttpParser parser;
+    tiny_http::HttpParser parser;
 
     const std::string raw = 
         "GET /index.html HTTP/1.1\r\n"
@@ -16,8 +14,8 @@ int main() {
         "Connection: keep-alive\r\n"	
         "\r\n";
 
-    const ParseResult result = parser.parse(raw);
-    assert(result.status == ParseStatus::Complete);
+    const tiny_http::ParseResult result = parser.parse(raw);
+    assert(result.status == tiny_http::ParseStatus::Complete);
     assert(result.request.method == "GET");
     assert(result.request.target == "/index.html");
     assert(result.request.version == "HTTP/1.1");
@@ -29,8 +27,8 @@ int main() {
         const std::string incomplete_raw = 
             "GET / HTTP/1.1\r\n"
             "Host: localhost\r\n";
-        const ParseResult incomplete = parser.parse(incomplete_raw);
-        assert(incomplete.status == ParseStatus::Incomplete);
+        const tiny_http::ParseResult incomplete = parser.parse(incomplete_raw);
+        assert(incomplete.status == tiny_http::ParseStatus::Incomplete);
     }
 
     // 测试2：相对路径（不以 / 开头）应返回 BadRequest
@@ -38,8 +36,8 @@ int main() {
         const std::string bad_raw = 
             "GET index.html HTTP/1.1\r\n"
             "\r\n";
-        const ParseResult bad = parser.parse(bad_raw);
-        assert(bad.status == ParseStatus::BadRequest);
+        const tiny_http::ParseResult bad = parser.parse(bad_raw);
+        assert(bad.status == tiny_http::ParseStatus::BadRequest);
     }
 
     // 测试3：POST 带 Body 应正确解析
@@ -49,19 +47,19 @@ int main() {
             "Content-Length: 5\r\n"
             "\r\n"
             "hello";
-        const ParseResult post = parser.parse(post_raw);
-        assert(post.status == ParseStatus::Complete);
+        const tiny_http::ParseResult post = parser.parse(post_raw);
+        assert(post.status == tiny_http::ParseStatus::Complete);
         assert(post.request.method == "POST");
         assert(post.request.body == "hello");
     }
 
     // 测试4：.html 扩展名应返回 text/html
     {
-        assert(mime_type_for_path("/index.html") == "text/html; charset=utf-8");
-        assert(mime_type_for_path("/path/to/page.HTML") == "text/html; charset=utf-8");
+        assert(tiny_http::mime_type_for_path("/index.html") == "text/html; charset=utf-8");
+        assert(tiny_http::mime_type_for_path("/path/to/page.HTML") == "text/html; charset=utf-8");
     }
     
-    HttpResponse response(200, "OK");
+    tiny_http::HttpResponse response(200, "OK");
     response.set_body("hello");
     const std::string text = response.serialize();
     assert(text.find("HTTP/1.1 200 OK\r\n") == 0);

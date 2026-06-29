@@ -13,6 +13,7 @@ add_library(tiny_http_core
     src/linux_server.cpp
     src/thread_pool.cpp
     src/async_logger.cpp
+    src/config_parser.cpp
 )
 
 target_include_directories(tiny_http_core PUBLIC
@@ -27,18 +28,27 @@ add_executable(parser_tests
     tests/parser_tests.cpp
 )
 
-add_executable(tiny_httpd
-    src/main.cpp
+add_executable(config_parser_tests
+    tests/config_parser_tests.cpp
 )
 
-target_link_libraries(tiny_httpd PRIVATE
-    tiny_http_core
+add_executable(tiny_httpd
+    src/main.cpp
 )
 
 target_link_libraries(parser_tests PRIVATE
     tiny_http_core
 )
 
+target_link_libraries(config_parser_tests PRIVATE
+    tiny_http_core
+)
+
+target_link_libraries(tiny_httpd PRIVATE
+    tiny_http_core
+)
+
 enable_testing()
 
 add_test(NAME parser_tests COMMAND parser_tests)
+add_test(NAME config_parser_tests COMMAND config_parser_tests)

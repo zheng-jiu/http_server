@@ -140,9 +140,4 @@ ParseResult HttpParser::parse(const std::string& buffer) const {
     return result;
 }
 
-
-
-
-
-
 } // namespace tiny_http
