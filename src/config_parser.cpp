@@ -128,11 +128,24 @@ private:
     }
 
     // 扫描数字：8080 -> "8080"
+    // 如果数字后紧跟字母（如 7d、30m），整体作为关键字"7d"返回
     Token scan_number() {
         std::string value;
         while (pos_ < input_.size() && std::isdigit(static_cast<unsigned char>(input_[pos_]))) {
             value += input_[pos_];
             pos_++;
+        }
+        // 数字后紧跟字母 → 这是复合值（如 7d），继续吃掉，按关键字返回
+        if (pos_ < input_.size() && std::isalpha(static_cast<unsigned char>(input_[pos_]))) {
+            while (pos_ < input_.size()
+                   && !std::isspace(static_cast<unsigned char>(input_[pos_]))
+                   && input_[pos_] != ';'
+                   && input_[pos_] != '{'
+                   && input_[pos_] != '}') {
+                value += input_[pos_];
+                pos_++;
+            }
+            return {TokenType::Keyword, value, line_};
         }
         return {TokenType::Number, value, line_};
     }
