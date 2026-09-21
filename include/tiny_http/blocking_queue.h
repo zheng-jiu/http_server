@@ -27,15 +27,34 @@ public:
     std::optional<T> pop()
     {
         std::unique_lock<std::mutex> lock(mutex_);
+
         cv_.wait(lock, [this] {
             return closed_ || !queue_.empty();
         });
+
         if (queue_.empty()) {
-            return std::nullopt; // 队列关闭且为空
+            return std::nullopt; // 队列为空且已关闭
         }
+
         T value = std::move(queue_.front());
         queue_.pop();
+        
         return value; 
+    }
+
+    // 尝试从队列取出任务（非阻塞）
+    std::optional<T> try_pop()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        if (queue_.empty()) {
+            return std::nullopt; // 队列为空
+        }
+
+        T value = std::move(queue_.front());
+        queue_.pop();
+
+        return value;
     }
 
     // 关闭队列

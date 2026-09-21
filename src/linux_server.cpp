@@ -3,6 +3,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
@@ -104,14 +105,41 @@ void LinuxHttpServer::setup_epoll()
         return;
     }
 
-    // 2. 准备事件结构：关注监听 fd 的可读事件
-    epoll_event event {};
-    event.events = EPOLLIN | EPOLLET; // 可读 + 边缘触发
-    event.data.fd = listen_fd_; // 事件发生时返回这个 fd
+    // 2. 注册监听 fd
+    epoll_event listen_event {};
+    listen_event.events = EPOLLIN | EPOLLET; // 可读 + 边缘触发
+    listen_event.data.fd = listen_fd_;
 
-    // 3. 把监听 fd 注册到 epoll
-    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, listen_fd_, &event) < 0) {
-        std::cerr << "epoll_ctl() failed\n";
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, listen_fd_, &listen_event) < 0) {
+        std::cerr << "epoll_ctl() listen_fd failed\n";
+
+        ::close(epoll_fd_);
+        epoll_fd_ = -1;
+        return;
+    }
+
+    // 3. 创建 eventfd
+    completion_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+
+    if (completion_fd_ < 0) {
+        std::cerr << "eventfd() failed\n";
+
+        ::close(epoll_fd_);
+        epoll_fd_ = -1;
+        return;
+    }
+
+    // 4. 把 eventfd 注册进 epoll
+    epoll_event completion_event {};
+    completion_event.events = EPOLLIN;
+    completion_event.data.fd = completion_fd_;
+
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, completion_fd_, &completion_event) < 0) {
+        std::cerr << "epoll_ctl() completion_fd failed\n";
+
+        ::close(completion_fd_);
+        completion_fd_ = -1;
+
         ::close(epoll_fd_);
         epoll_fd_ = -1;
         return;
@@ -163,6 +191,12 @@ bool LinuxHttpServer::start()
                 continue;
             }
 
+            // worker 完成通知 fd ，有响应结果
+            if (fd == completion_fd_) {
+                handle_completions();
+                continue;
+            }
+
             // 客户端 fd ，可读
             if ((flags & EPOLLIN) != 0) {
                 handle_read(fd);
@@ -205,13 +239,19 @@ void LinuxHttpServer::stop()
         listen_fd_ = -1;
     }
     
-    // 5.关闭 epoll 实例
+    // 5.关闭 worker 完成通知 eventfd
+    if (completion_fd_ >= 0) {
+        ::close(completion_fd_);
+        completion_fd_ = -1;
+    }
+
+    // 6.关闭 epoll 实例
     if (epoll_fd_ >= 0) {
         ::close(epoll_fd_);
         epoll_fd_ = -1;
     }
 
-    // 6.停止日志线程（最后停止，之前的操作还可以记日志）
+    // 7.停止日志线程（最后停止，之前的操作还可以记日志）
     logger_.stop(); 
 }
 
@@ -249,8 +289,10 @@ void LinuxHttpServer::accept_clients()
         ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, client_fd, &event);
 
         // 5. 加入连接表
+        const std::uint64_t connection_id = next_connection_id_++;
         connections_.emplace(client_fd, Connection{
             .fd {client_fd},                // fd
+            .id {connection_id},            // id
             .in {},                         // in（空）
             .out {},                        // out (空)
             .close_after_write {true},      // close_after_write（未知，待解析后决定）
@@ -279,82 +321,81 @@ void LinuxHttpServer::close_connection(int fd)
 
 // ---- 处理请求并生成响应 ----
 
-void LinuxHttpServer::process_request(int fd, const std::string& raw)
+LinuxHttpServer::ResponseResult LinuxHttpServer::process_request(int fd, std::uint64_t connection_id, const std::string& raw)
 {
-    std::unordered_map<int, Connection>::iterator it = connections_.find(fd);
-    if (it == connections_.end()) {
-        return;
-    }
-    Connection& conn = it->second;
+    ResponseResult result;
 
-    // ===== 第1步：解析 raw 请求字符串 =====
+    result.fd = fd;
+    result.connection_id = connection_id;
+
+    // 1. 解析 HTTP 请求
     const ParseResult parsed = parser_.parse(raw);
+
     if (parsed.status != ParseStatus::Complete) {
-        // raw 应该是一个完整请求，如果不是则关闭连接
-        close_connection(fd);
-        return;
+        // worker 不再自己 close
+        // 只告诉 I/O 线程：这个连接需要关闭
+        result.close_connection = true;
+        return result;
     }
+
     const HttpRequest& request = parsed.request;
 
-    // 根据请求的 Connection 头决定是否 Keep-Alive
-    if (!request.keep_alive()) {
-        conn.close_after_write = true;
-    } else {
-        conn.close_after_write = false;
-    }
+    // 2. 是否 Keep-Alive
+    result.close_after_write = !request.keep_alive();
 
     logger_.log(LogLevel::Info, "请求 fd=" + std::to_string(fd)
-                + " " + request.method + " " + request.target
-                + " " + request.version);
+        + " " + request.method + " " + request.target + " " + request.version);
 
-    // ===== 第2步：检查 method =====
+    // 3. method 检查
     if (request.method != "GET" && request.method != "HEAD") {
         HttpResponse response(405, "Method Not Allowed");
+
         response.set_body("Method Not Allowed");
         response.set_header("Allow", "GET, HEAD");
-        response.set_keep_alive(!conn.close_after_write);
-        conn.out = response.serialize();
-        switch_to_epollout(fd);
-        return;
+        response.set_keep_alive(!result.close_after_write);
+
+        result.response = response.serialize();
+        return result;
     }
 
-    // ===== 第3步：target 映射到文件路径 =====
-    std::string path = map_target_to_path(request.target);
+    // 4. URL -> 文件路径
+    const std::string path = map_target_to_path(request.target);
+
     if (path.empty()) {
         HttpResponse response(403, "Forbidden");
+
         response.set_body("Forbidden");
-        response.set_keep_alive(!conn.close_after_write);
-        conn.out = response.serialize();
-        switch_to_epollout(fd);
-        return;
+        response.set_keep_alive(!result.close_after_write);
+    
+        result.response = response.serialize();
+        return result;
     }
 
-    // ===== 第4步：打开文件 =====
+    // 5. 打开静态文件
     std::ifstream file(path, std::ios::binary);
+
     if (!file) {
         HttpResponse response(404, "Not Found");
+
         response.set_body("Not Found");
-        response.set_keep_alive(!conn.close_after_write);
-        conn.out = response.serialize();
-        switch_to_epollout(fd);
-        return;
+        response.set_keep_alive(!result.close_after_write);
+
+        result.response = response.serialize();
+        return result;
     }
 
-    // ===== 第5步：读取文件内容 =====
+    // 6. 读取文件
     std::ostringstream contents;
     contents << file.rdbuf();
-    file.close();
 
-    // ===== 第6-7步：设置 MIME + 生成响应字符串 =====
+    // 7. 生成响应
     HttpResponse response(200, "OK");
-    response.set_body(
-        request.method == "HEAD" ? std::string{} : contents.str(),
-        mime_type_for_path(path));
-    response.set_keep_alive(!conn.close_after_write);
-    conn.out = response.serialize();
-    
-    // 切换到写模式，等待 EPOLLOUT 发送响应
-    switch_to_epollout(fd);
+
+    response.set_body(request.method == "HEAD" ? std::string{} : contents.str(), mime_type_for_path(path));
+    response.set_keep_alive(!result.close_after_write);
+
+    result.response = response.serialize();
+    return result;
 }
 
 // ---- 路径穿越检测 ----
@@ -424,10 +465,6 @@ void LinuxHttpServer::switch_to_epollin(int fd)
     if (it == connections_.end()) {
         return;
     }
-    Connection& conn = it->second;
-
-    // 重置处理状态，准备接收下一个 HTTP 请求
-    conn.processing = false;
 
     epoll_event event{};
     event.events = EPOLLIN | EPOLLRDHUP | EPOLLET; // 关注可读 + 对端关闭 + 边缘触发
@@ -437,6 +474,62 @@ void LinuxHttpServer::switch_to_epollin(int fd)
         std::cerr << "epoll_ctl MOD (->EPOLLIN) fd=" << fd << " failed\n";
         close_connection(fd);
     }
+}
+
+bool LinuxHttpServer::try_submit_next_request(int fd) {
+    std::unordered_map<int, Connection>::iterator it = connections_.find(fd);
+    if (it == connections_.end()) {
+        return false;
+    }
+
+    Connection& conn = it->second;
+
+    // 当前已经有请求正在处理中
+    if (conn.processing) {
+        return true;
+    }
+
+    const ParseResult parsed = parser_.parse(conn.in);
+
+    if (parsed.status == ParseStatus::Incomplete) {
+        return true;
+    }
+
+    if (parsed.status == ParseStatus::BadRequest) {
+        close_connection(fd);
+        return false;
+    }
+
+    // 取出一个完整请求
+    std::string raw = conn.in.substr(0, parsed.consumed);
+
+    conn.in.erase(0, parsed.consumed);
+
+    // 从现在开始，该连接不允许再提交第二个请求
+    conn.processing = true;
+
+    const std::uint64_t connection_id = conn.id;
+
+    thread_pool_.submit(
+        [this, fd, connection_id, raw = std::move(raw)] {
+            ResponseResult result = process_request(fd, connection_id, raw);
+
+            completion_queue_.push(std::move(result));
+
+            std::uint64_t one = 1;
+            const ssize_t n = ::write(completion_fd_, &one, sizeof(one));
+
+            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                logger_.log(
+                    LogLevel::Error,
+                    "write(eventfd) failed errno="
+                    + std::to_string(errno)
+                );
+            }
+        }
+    );
+
+    return true;
 }
 
 // ---- 读取客户端请求 ----
@@ -460,45 +553,22 @@ void LinuxHttpServer::handle_read(int fd)
             conn.in.append(buffer, static_cast<std::size_t>(n));
             conn.last_active_ms = now_ms(); // 更新活跃时间
 
-            // 尝试解析
-            // ===== 内层循环：parse 直到 conn.in 耗尽或 Incomplete =====
-            while (true) {
-                const ParseResult parsed = parser_.parse(conn.in);
-                
-                if (parsed.status == ParseStatus::Complete) {
-                    // 请求完整：取出一个完整请求的 raw 字符串，
-                    std::string raw = conn.in.substr(0, parsed.consumed);
-                    // 从输入缓冲区删除已处理部分
-                    conn.in.erase(0, parsed.consumed);
-                    // 标记正在处理，防止重复提交
-                    conn.processing = true;
-                    
-                    // 提交到线程池（不阻塞事件循环！）
-                    thread_pool_.submit([this, fd, raw = std::move(raw)] {
-                        process_request(fd, raw);
-                    });
-
-                    // ← 继续内层循环，检查擦除后剩余数据是否也完整
-                }
-                else if (parsed.status == ParseStatus::BadRequest) {
-                    std::cerr << "[解析] fd=" << fd << " 坏请求："
-                              << parsed.error << "\n";
-                    close_connection(fd);
-                    return;
-                }
-                else {
-                    // Incomplete → 退出内层 parse 循环，回到外层继续 recv
-                    break;
-                }
+            // 尝试提交一个请求
+            // 如果 processing == true，这里什么都不会提交
+            if (!try_submit_next_request(fd)) {
+                return;
             }
 
-        } else if (n == 0) {
+            // 注意：不能 return
+            // 外层仍然继续 recv，直到 EAGAIN
+        } 
+        else if (n == 0) {
             // 对端关闭连接(FIN)
             std::cout << "[读] fd=" << fd << " 对端关闭连接\n";
             close_connection(fd);
             return;
-
-        } else {   // n < 0
+        } 
+        else {  // n < 0
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 // 内核缓冲区暂时空了，退出读循环
                 break;
@@ -512,7 +582,6 @@ void LinuxHttpServer::handle_read(int fd)
     }
 }
 
-
 // ---- 写回响应 ----
 
 void LinuxHttpServer::handle_write(int fd)
@@ -521,40 +590,100 @@ void LinuxHttpServer::handle_write(int fd)
     if (it == connections_.end()) {
         return;
     }
+
     Connection& conn = it->second;
 
-    // 发送 conn.out 中剩余的全部数据
-    const std::string& chunk = conn.out;
-    const ssize_t n = ::send(fd, chunk.data(), chunk.size(), MSG_NOSIGNAL);
+    // ET 模式：一直发送，直到全部发完或内核发送缓冲区满
+    while (!conn.out.empty()) {
+        const ssize_t n = ::send(fd, conn.out.data(), conn.out.size(), MSG_NOSIGNAL);
 
-    if (n > 0) {
-        // 1. 成功发送了 n 字节 -> 从发送缓冲区删除已发送部分
-        conn.out.erase(0, static_cast<std::size_t>(n));
-
-        // 2. 全部发完了？
-        if (conn.out.empty()) {
-            if (conn.close_after_write) {
-                // 3. Connection: close -> 关闭连接
-                close_connection(fd);
-            } else {
-                // 4. Connection: keep-alive -> 切回读模式，等待下一个请求
-                switch_to_epollin(fd);
-            }
+        if (n > 0) {
+            // 删除已经成功交给内核发送缓冲区的数据
+            conn.out.erase(0, static_cast<std::size_t>(n));
+            continue;
         }
-        // out 不为空 -> 剩余的等下次 EPOLLOUT 继续发
 
-    } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        // 5. 内核发送缓冲区满了，等下次 EPOLLOUT
-        return;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // 内核发送缓冲区暂时满了，当前不可写
+            // 保留 conn.out 剩余数据，等待下一次 EPOLLOUT 后继续发送
+            return;
+        }
 
-    } else {
-        // 6. 对端关闭（收到 RST）或其他错误
+        // 对端关闭或其他错误
         std::cerr << "send() fd=" << fd << " 错误 errno=" << errno << "\n";
+
         close_connection(fd);
+        return;
+    }
+
+    // 到这里说明 conn.out 已经全部发送完成
+    if (conn.close_after_write) {
+        close_connection(fd);
+        return;
+    }
+
+    // Keep-Alive：
+    // 当前请求完整结束，允许处理同一连接的下一个请求
+    conn.processing = false;
+
+    switch_to_epollin(fd);
+
+    // 下一个请求可能已经提前缓存到 conn.in
+    if (!try_submit_next_request(fd)) {
+        return;
     }
 }
 
-// ---- 清理超时连接
+// ---- 处理 worker 完成通知 ----
+
+void LinuxHttpServer::handle_completions()
+{
+    // 1. 消费 eventfd 通知（计数器清零）
+    std::uint64_t count = 0;
+    const ssize_t n = ::read(completion_fd_, &count, sizeof(count));
+
+    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        std::cerr << "read(eventfd) failed, errno=" << errno << "\n";
+        return;
+    }
+
+    // 2. 把当前完成队列中的结果全部取出来
+    while (true) {
+        std::optional<tiny_http::LinuxHttpServer::ResponseResult> result = completion_queue_.try_pop();
+
+        if (!result.has_value()) {
+            break; // 队列空了
+        }
+
+        // 3. fd 是否仍然存在？
+        std::unordered_map<int, Connection>::iterator it = connections_.find(result->fd);
+
+        if (it == connections_.end()) {
+            continue; // fd 已经关闭了，忽略
+        }
+
+        Connection& conn = it->second;
+
+        // 4. fd 是否已经被复用成另一条连接？
+        if (conn.id != result->connection_id) {
+            continue; // fd 已经被复用，忽略
+        }
+
+        if (result->close_connection) {
+            close_connection(result->fd);
+            continue;
+        }
+
+        // 5. 结果写回 Connection
+        conn.out = std::move(result->response);
+        conn.close_after_write = result->close_after_write;
+
+        // 6. 接下来由 I/O 线程负责发送响应，切换到 EPOLLOUT
+        switch_to_epollout(result->fd);
+    }
+}
+
+// ---- 清理超时连接 ----
 
 void LinuxHttpServer::sweep_idle_connections()
 {
