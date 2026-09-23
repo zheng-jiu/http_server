@@ -7,6 +7,7 @@
 #include "tiny_http/mime_types.h"
 #include "tiny_http/thread_pool.h"
 
+#include <sys/types.h>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -32,6 +33,11 @@ private:
         std::uint64_t connection_id {0};
 
         std::string response;
+
+        // GET 静态文件时，由 worker 打开文件并将所有权交给 I/O 线程
+        int file_fd {-1};
+        std::size_t file_size {0};
+        
         bool close_after_write {true};
 
         // 不发送响应，直接由 I/O 线程关闭该连接
@@ -45,6 +51,10 @@ private:
 
         std::string in;
         std::string out;
+
+        int file_fd {-1};
+        off_t file_offset {0};
+        std::size_t file_remaining {0};
 
         bool close_after_write {true};
         bool processing {false};

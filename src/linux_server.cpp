@@ -2,8 +2,11 @@
 
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/stat.h>
+#include <sys/sendfile.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
@@ -11,8 +14,6 @@
 #include <vector>
 #include <cerrno>
 #include <chrono>
-#include <fstream>
-#include <sstream>
 
 namespace tiny_http {
 
@@ -229,8 +230,15 @@ void LinuxHttpServer::stop()
     // 3.关闭所有客户端连接
     for (auto& [fd, conn] : connections_) {
         ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+
+        if (conn.file_fd >= 0) {
+            ::close(conn.file_fd);
+            conn.file_fd = -1;
+        }
+
         ::close(fd);
     }
+
     connections_.clear();
 
     // 4.关闭监听 socket
@@ -260,18 +268,18 @@ void LinuxHttpServer::stop()
 void LinuxHttpServer::accept_clients()
 {
     while (true) {
-        // 1. 准备客户端地址结构
+        // 准备客户端地址结构
         sockaddr_in client_addr {};
         socklen_t len = sizeof(client_addr);
 
-        // 2. 接受新连接（一步到位：非阻塞 + close-on-exec）
+        // 接受新连接（一步到位：非阻塞 + close-on-exec）
         const int client_fd = ::accept4(
             listen_fd_,
             reinterpret_cast<sockaddr*>(&client_addr),
             &len,
             SOCK_NONBLOCK | SOCK_CLOEXEC);
 
-        // 3. 判断结果
+        // 判断结果
         if (client_fd < 0) {
             // ET 模式下循环到没有新连接为止
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -282,13 +290,20 @@ void LinuxHttpServer::accept_clients()
             break;
         }
 
-        // 4. 把新 client fd 注册到 epoll
+        int flag = 1;
+
+        // 禁用 Nagle 算法，让小块数据不要因为等待前一个包 ACK 而被延迟
+        if (::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) < 0) {
+            std::cerr << "setsockopt(TCP_NODELAY) failed, fd=" << client_fd << " errno=" << errno << "\n";
+        }
+
+        // 把新 client fd 注册到 epoll
         epoll_event event {};
         event.events = EPOLLIN | EPOLLRDHUP | EPOLLET; // 可读 | 对端关闭 | 边缘触发
         event.data.fd = client_fd;
         ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, client_fd, &event);
 
-        // 5. 加入连接表
+        // 加入连接表
         const std::uint64_t connection_id = next_connection_id_++;
         connections_.emplace(client_fd, Connection{
             .fd {client_fd},                // fd
@@ -309,12 +324,24 @@ void LinuxHttpServer::accept_clients()
 
 void LinuxHttpServer::close_connection(int fd)
 {
+    std::unordered_map<int, Connection>::iterator it = connections_.find(fd);
+
+    if (it != connections_.end()) {
+        if (it->second.file_fd >= 0) {
+            ::close(it->second.file_fd);
+            it->second.file_fd = -1;
+        }
+    }
+
     // 从 epoll 移除
     ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-    // 关闭 fd
+
+    // 关闭客户端 socket
     ::close(fd);
-    // 从连接表删除
+
+    // 删除连接状态
     connections_.erase(fd);
+
     logger_.log(LogLevel::Info, "连接关闭 fd=" + std::to_string(fd)
                 + " 剩余连接数=" + std::to_string(connections_.size()));
 }
@@ -372,9 +399,9 @@ LinuxHttpServer::ResponseResult LinuxHttpServer::process_request(int fd, std::ui
     }
 
     // 5. 打开静态文件
-    std::ifstream file(path, std::ios::binary);
+    const int file_fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
 
-    if (!file) {
+    if (file_fd < 0) {
         HttpResponse response(404, "Not Found");
 
         response.set_body("Not Found");
@@ -384,17 +411,46 @@ LinuxHttpServer::ResponseResult LinuxHttpServer::process_request(int fd, std::ui
         return result;
     }
 
-    // 6. 读取文件
-    std::ostringstream contents;
-    contents << file.rdbuf();
+    // 6. 获取文件大小
+    struct stat file_stat {};
 
-    // 7. 生成响应
+    if (::fstat(file_fd, &file_stat) < 0 || !S_ISREG(file_stat.st_mode)) {
+        ::close(file_fd);
+
+        HttpResponse response(404, "Not Found");
+        
+        response.set_body("Not Found");
+        response.set_keep_alive(!result.close_after_write);
+
+        result.response = response.serialize();
+        return result;
+    }
+
+    const std::size_t file_size = static_cast<std::size_t>(file_stat.st_size);
+
+    // 7. 生成 HTTP 响应头
     HttpResponse response(200, "OK");
 
-    response.set_body(request.method == "HEAD" ? std::string{} : contents.str(), mime_type_for_path(path));
+    // body 留空，文件正文后续由 I/O 线程通过 sendfile() 发送
+    response.set_body(std::string{}, mime_type_for_path(path));
+
+    // Content-Length 必须是真实文件大小
+    response.set_header("Content-Length", std::to_string(file_size));
+
     response.set_keep_alive(!result.close_after_write);
 
     result.response = response.serialize();
+
+    // HEAD 只返回响应头，不发送文件正文
+    if (request.method == "HEAD") {
+        ::close(file_fd);
+        return result;
+    }
+
+    // GET: 把文件 fd 和大小交给 I/O 线程
+    result.file_fd = file_fd;
+    result.file_size = file_size;
+
     return result;
 }
 
@@ -593,6 +649,7 @@ void LinuxHttpServer::handle_write(int fd)
 
     Connection& conn = it->second;
 
+    // 1. 先发送 HTTP 响应头
     // ET 模式：一直发送，直到全部发完或内核发送缓冲区满
     while (!conn.out.empty()) {
         const ssize_t n = ::send(fd, conn.out.data(), conn.out.size(), MSG_NOSIGNAL);
@@ -600,6 +657,8 @@ void LinuxHttpServer::handle_write(int fd)
         if (n > 0) {
             // 删除已经成功交给内核发送缓冲区的数据
             conn.out.erase(0, static_cast<std::size_t>(n));
+
+            conn.last_active_ms = now_ms();
             continue;
         }
 
@@ -616,13 +675,45 @@ void LinuxHttpServer::handle_write(int fd)
         return;
     }
 
-    // 到这里说明 conn.out 已经全部发送完成
+    // 2. HTTP 头发送完成后，通过 sendfile 发送静态文件正文
+    while (conn.file_fd >= 0 && conn.file_remaining > 0) {
+        const ssize_t n = ::sendfile(fd, conn.file_fd, &conn.file_offset, conn.file_remaining);
+
+        if (n > 0) {
+            conn.file_remaining -= static_cast<std::size_t>(n);
+
+            conn.last_active_ms = now_ms();
+            continue;
+        }
+
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // 内核发送缓冲区暂时满了，当前不可写
+            // 保留文件发送状态，等待下一次 EPOLLOUT 后继续发送
+            return;
+        }
+
+        // n == 0 但文件仍未发完，或者发生其他错误
+        std::cerr << "sendfile() fd=" << fd << " 错误 errno=" << errno << "\n";
+
+        close_connection(fd);
+        return;
+    }
+
+    // 3. 文件正文已经全部发送完成，释放文件 fd
+    if (conn.file_fd >= 0) {
+        ::close(conn.file_fd);
+        conn.file_fd = -1;
+        conn.file_offset = 0;
+        conn.file_remaining = 0;
+    }
+
+    // 4. Connection: close
     if (conn.close_after_write) {
         close_connection(fd);
         return;
     }
 
-    // Keep-Alive：
+    // 5. Keep-Alive：
     // 当前请求完整结束，允许处理同一连接的下一个请求
     conn.processing = false;
 
@@ -659,6 +750,12 @@ void LinuxHttpServer::handle_completions()
         std::unordered_map<int, Connection>::iterator it = connections_.find(result->fd);
 
         if (it == connections_.end()) {
+            // worker 已经打开了文件，但连接没了
+            // 必须释放文件 fd，防止泄漏
+            if (result->file_fd >= 0) {
+                ::close(result->file_fd);
+            }
+
             continue; // fd 已经关闭了，忽略
         }
 
@@ -666,19 +763,36 @@ void LinuxHttpServer::handle_completions()
 
         // 4. fd 是否已经被复用成另一条连接？
         if (conn.id != result->connection_id) {
+            if (result->file_fd >= 0) {
+                ::close(result->file_fd);
+            }
+
             continue; // fd 已经被复用，忽略
         }
 
+        // 5. worker 要求直接关闭连接
         if (result->close_connection) {
+            if (result->file_fd >= 0) {
+                ::close(result->file_fd);
+            }
+
             close_connection(result->fd);
             continue;
         }
 
-        // 5. 结果写回 Connection
+        // 6. 接管 HTTP 响应头
         conn.out = std::move(result->response);
         conn.close_after_write = result->close_after_write;
 
-        // 6. 接下来由 I/O 线程负责发送响应，切换到 EPOLLOUT
+        // 7. 接管静态文件发送状态
+        conn.file_fd = result->file_fd;
+        conn.file_offset = 0;
+        conn.file_remaining = result->file_size;
+
+        // 表示文件 fd 所有权已经交给 Connection
+        result->file_fd = -1;
+
+        // 8. 由 I/O 线程负责实际发送
         switch_to_epollout(result->fd);
     }
 }

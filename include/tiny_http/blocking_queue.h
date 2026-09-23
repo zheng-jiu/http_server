@@ -42,7 +42,7 @@ public:
         return value; 
     }
 
-    // 尝试从队列取出任务（非阻塞）
+    // 尝试从队列取出结果（非阻塞）
     std::optional<T> try_pop()
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -67,11 +67,15 @@ public:
         cv_.notify_all();  // 唤醒所有等待线程
     }
 
-    bool is_closed() const { return closed_; }
+    bool is_closed() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_); 
+        return closed_; 
+    }
 
 private:
     std::queue<T> queue_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::condition_variable cv_;
     bool closed_ {false};
 };

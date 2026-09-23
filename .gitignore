@@ -33,3 +33,9 @@ compile_commands.json
 
 # 测试产物
 Testing/
+
+# 压测测试文件
+www/bench_*.bin
+
+# 本地压测结果
+bench-results/
