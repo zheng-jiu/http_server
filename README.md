@@ -6,11 +6,13 @@
 
 静态文件传输使用 sendfile，避免将文件正文完整读入用户态字符串；客户端 Socket 开启 TCP_NODELAY，避免响应头与文件正文分开发送时出现明显的小响应延迟。
 
+SIGINT / SIGTERM 通过 signalfd 接入 epoll 事件循环，由 I/O 线程统一触发服务器停止流程；同时忽略 SIGPIPE，使客户端异常断开时的发送失败通过错误码处理，避免单个连接导致服务器进程退出。
+
 项目定位为持续迭代的学习项目，不作为可直接用于生产环境的成熟服务器。
 
 ## 技术栈
 
-C++20 · Linux · TCP / Socket · epoll ET · eventfd · sendfile · TCP_NODELAY · HTTP/1.1 · std::thread · mutex · condition_variable · CMake · Git · wrk
+C++20 · Linux · TCP / Socket · epoll ET · eventfd · signalfd · sendfile · TCP_NODELAY · HTTP/1.1 · std::thread · mutex · condition_variable · CMake · Git · wrk
 
 ## 已实现功能
 
@@ -27,6 +29,8 @@ C++20 · Linux · TCP / Socket · epoll ET · eventfd · sendfile · TCP_NODELAY
 - **sendfile 静态文件传输**：worker 使用 open / fstat 获取静态文件信息，由 I/O 线程使用 sendfile 发送文件正文。
 - **HEAD 请求处理**：HEAD 不发送资源正文，但 Content-Length 保留对应资源的实际正文大小。
 - **TCP_NODELAY**：解决响应头与 sendfile 文件正文分开发送时，小响应出现明显延迟的问题。
+- **安全信号处理**：屏蔽 SIGINT / SIGTERM，并通过 signalfd 将退出信号接入 epoll，由 I/O 线程统一触发服务器停止流程。
+- **异常发送保护**：忽略 SIGPIPE，使客户端异常断开时的发送失败通过错误码处理，避免单个连接导致服务器进程退出。
 - **异步日志**：使用后台线程写入日志文件。
 - **连接超时处理**：根据最近活动时间清理空闲 Keep-Alive 连接。
 - **配置与构建**：支持配置文件解析、命令行参数覆盖、CMake 构建以及基础模块测试。
@@ -249,6 +253,50 @@ sendfile(
         → 等待下一次 EPOLLOUT
 ```
 
+## 信号与停止流程
+
+SIGINT 和 SIGTERM 不再由异步信号处理函数直接执行复杂清理。
+
+程序启动时先屏蔽退出信号，再通过 signalfd 将它们转换为可以由 epoll 监听的文件描述符事件：
+
+```text
+Ctrl+C / SIGTERM
+    ↓
+signalfd
+    ↓
+EPOLLIN
+    ↓
+I/O 线程读取退出信号
+    ↓
+running = false
+    ↓
+退出事件循环
+    ↓
+stop()
+```
+
+停止流程中：
+
+```text
+停止线程池并等待 worker
+    ↓
+清理完成队列中尚未移交的文件 fd
+    ↓
+释放客户端连接及其文件 fd
+    ↓
+关闭 listen_fd
+    ↓
+关闭 completion_fd
+    ↓
+关闭 signal_fd
+    ↓
+关闭 epoll_fd
+    ↓
+停止日志线程
+```
+
+同时忽略 SIGPIPE，使 `send` / `sendfile` 面对已经断开的客户端时通过错误返回处理，而不是直接终止整个服务器进程。
+
 ## 静态文件发送优化
 
 ### 优化前
@@ -315,7 +363,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build -j
 ```
 
-网络模块依赖 Linux 的 epoll、eventfd、sendfile 等接口，不能直接作为原生 Windows 网络程序编译运行。
+网络模块依赖 Linux 的 epoll、eventfd、signalfd、sendfile 等接口，不能直接作为原生 Windows 网络程序编译运行。
 
 ## 运行
 
@@ -390,7 +438,7 @@ server {
 | `proxy_pass` | 可解析，尚未实现反向代理 |
 | `expires` | 可解析，尚未实现缓存过期控制 |
 
-当前 `-c` 配置文件参数与位置参数覆盖逻辑仍存在冲突，后续继续整理。
+当前 `-c` 配置文件参数与位置参数覆盖逻辑仍存在冲突。
 
 ## 测试
 
@@ -420,6 +468,14 @@ sendfile 修改后的功能验证：
 - 4 KiB、100 KiB、1 MiB 文件使用 curl 下载后，通过 cmp 验证内容一致。
 - 1 MiB 文件 HEAD 请求返回 `Content-Length: 1048576`。
 - 首页 HEAD 请求返回对应 index.html 的实际正文大小。
+
+异常连接与停止流程验证：
+
+- 使用 32 MiB 静态文件、64 KiB/s 限速和 2 秒客户端超时，连续主动中断 3 次下载。
+- 服务端 sendfile 返回连接重置错误后没有退出，随后首页请求仍正常返回 HTTP 200。
+- 文件传输过程中发送 SIGTERM，服务器通过 signalfd 收到退出信号并正常结束。
+- SIGTERM 停止测试中服务器退出码为 0。
+- Ctrl+C / SIGINT 同样能够通过 signalfd 触发正常退出。
 
 这些测试不能代表所有并发、异常连接和长期稳定性场景均已验证。
 
@@ -530,7 +586,6 @@ Requests/sec ≈ 2,437
 
 该对照实验与 Nagle 算法和延迟 ACK 交互造成的小响应延迟现象相符，但当前尚未通过 tcpdump / Wireshark 抓包进一步确认完整报文时序。
 
-
 ## 项目目的
 
 通过实际实现：
@@ -545,6 +600,6 @@ Requests/sec ≈ 2,437
 → 对照复测
 ```
 
-理解 Linux Socket、epoll、HTTP、多线程协作、连接生命周期以及静态文件传输。
+理解 Linux Socket、epoll、HTTP、多线程协作、连接生命周期、信号处理以及静态文件传输。
 
 项目优先保证正确性和可解释性，再根据真实测量结果进行性能优化，避免为了增加功能而增加不必要的复杂度。

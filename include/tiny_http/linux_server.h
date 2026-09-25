@@ -102,6 +102,7 @@ private:
     int listen_fd_ {-1};
     int epoll_fd_ {-1};
     int completion_fd_ {-1};
+    int signal_fd_ {-1};
 
     bool running_ {false};
 

@@ -7,6 +7,8 @@
 #include <sys/eventfd.h>
 #include <sys/stat.h>
 #include <sys/sendfile.h>
+#include <signal.h>
+#include <sys/signalfd.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
@@ -169,6 +171,40 @@ bool LinuxHttpServer::start()
         return false;
     }
 
+    // 接收 main() 中已经屏蔽的退出信号
+    sigset_t stop_signals {};
+    ::sigemptyset(&stop_signals);
+    ::sigaddset(&stop_signals, SIGINT);
+    ::sigaddset(&stop_signals, SIGTERM);
+
+    signal_fd_ = ::signalfd(
+        -1,
+        &stop_signals,
+        SFD_NONBLOCK | SFD_CLOEXEC
+    );
+
+    if (signal_fd_ < 0) {
+        std::cerr << "signalfd() failed, errno=" << errno << "\n";
+        stop();
+        return false;
+    }
+
+    // 将退出信号加入现有 epoll 事件循环
+    epoll_event signal_event {};
+    signal_event.events = EPOLLIN;
+    signal_event.data.fd = signal_fd_;
+
+    if (::epoll_ctl(
+        epoll_fd_,
+        EPOLL_CTL_ADD,
+        signal_fd_,
+        &signal_event) < 0)
+    {
+        std::cerr << "epoll_ctl() signal_fd failed, errno=" << errno << "\n";
+        stop();
+        return false;
+    }
+
     logger_.log(LogLevel::Info, "Server started on port " + std::to_string(config_.port));
 
     // ----事件循环----
@@ -185,6 +221,31 @@ bool LinuxHttpServer::start()
         for (int i = 0; i < count; ++i) {
             const int fd = events[i].data.fd;
             const uint32_t flags = events[i].events;
+
+            // 退出信号：在正常的 I/O 线程执行流程中处理
+            if (fd == signal_fd_) {
+                struct signalfd_siginfo info {};
+                ssize_t n;
+
+                do {
+                    n = ::read(signal_fd_, &info, sizeof(info));
+                } while (n < 0 && errno == EINTR);
+
+                if (n == static_cast<ssize_t>(sizeof(info))) {
+                    std::cout << "收到退出信号 " << info.ssi_signo << "，准备停止服务器\n";
+
+                    running_ = false;
+                    break; // 先退出本轮 for
+                }
+
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    continue;
+                }
+
+                std::cerr << "read(signalfd) failed\n";
+                stop();
+                return false;
+            }
 
             // 监听 fd ，新连接到达
             if (fd == listen_fd_) {
@@ -207,11 +268,15 @@ bool LinuxHttpServer::start()
             if ((flags & EPOLLOUT) != 0) {
                 handle_write(fd);
             }
+        } // for 结束
+
+        if (!running_) {
+            break; // 再退出外层 while
         }
 
         // 每轮循环末尾清理超时空闲连接
         sweep_idle_connections();
-    }
+    } // while 结束
 
     stop();  // 事件循环退出后有序释放所有资源
     return true;
@@ -221,13 +286,21 @@ bool LinuxHttpServer::start()
 
 void LinuxHttpServer::stop()
 {
-    // 1.通知事件循环退出
+    // 通知事件循环退出
     running_ = false;
 
-    // 2.停止线程池(等待所有工作线程结束)
-    thread_pool_.stop(); 
+    // 停止线程池(等待所有工作线程结束)
+    thread_pool_.stop();
 
-    // 3.关闭所有客户端连接
+    // worker 已全部结束，不会再向完成队列添加结果
+    // 释放尚未移交给 Connection 的文件 fd
+    while (std::optional<tiny_http::LinuxHttpServer::ResponseResult> result = completion_queue_.try_pop()) {
+        if (result->file_fd >= 0) {
+            ::close(result->file_fd);
+        }
+    }
+
+    // 关闭所有客户端连接
     for (auto& [fd, conn] : connections_) {
         ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
 
@@ -241,25 +314,31 @@ void LinuxHttpServer::stop()
 
     connections_.clear();
 
-    // 4.关闭监听 socket
+    // 关闭监听 socket
     if (listen_fd_ >= 0) {
         ::close(listen_fd_);
         listen_fd_ = -1;
     }
     
-    // 5.关闭 worker 完成通知 eventfd
+    // 关闭 worker 完成通知 eventfd
     if (completion_fd_ >= 0) {
         ::close(completion_fd_);
         completion_fd_ = -1;
     }
 
-    // 6.关闭 epoll 实例
+    // 关闭退出信号 fd
+    if (signal_fd_ >= 0) {
+        ::close(signal_fd_);
+        signal_fd_ = -1;
+    }
+
+    // 关闭 epoll 实例
     if (epoll_fd_ >= 0) {
         ::close(epoll_fd_);
         epoll_fd_ = -1;
     }
 
-    // 7.停止日志线程（最后停止，之前的操作还可以记日志）
+    // 停止日志线程（最后停止，之前的操作还可以记日志）
     logger_.stop(); 
 }
 

@@ -5,23 +5,36 @@
 #include <iostream>
 #include <cstdlib>
 #include <string>
-
-// 全局服务器指针（信号处理函数需要访问）
-tiny_http::LinuxHttpServer* g_server = nullptr;
-
-// 信号处理函数
-void handle_signal(int /*signum*/)
-{
-    if (g_server != nullptr) {
-        g_server->stop(); // 触发优雅关闭
-    }
-}
+#include <signal.h>
+#include <cerrno>
+#include <pthread.h>
 
 int main(int argc, char* argv[])
 {
-    // 注册信号处理
-    std::signal(SIGINT, handle_signal);  // Ctrl+C
-    std::signal(SIGTERM, handle_signal);  // kill 命令
+    // 忽略 SIGPIPE，让发送失败通过返回值报告
+    // 避免单个连接断开导致整个服务器进程退出
+    struct sigaction action {};
+    action.sa_handler = SIG_IGN;
+    ::sigemptyset(&action.sa_mask);
+
+    if (::sigaction(SIGPIPE, &action, nullptr) < 0) {
+        std::cerr << "sigaction(SIGPIPE) failed, errno=" << errno << "\n";
+        return 1;
+    }
+
+    // 屏蔽退出信号，后续由 I/O 线程通过 signalfd 接收
+    sigset_t stop_signals {};
+    ::sigemptyset(&stop_signals);
+    ::sigaddset(&stop_signals, SIGINT);
+    ::sigaddset(&stop_signals, SIGTERM);
+
+    const int error = ::pthread_sigmask(SIG_BLOCK, &stop_signals, nullptr);
+
+    if (error != 0) {
+        // pthread_sigmask 直接返回错误码，不是通过 errno 报告
+        std::cerr << "pthread_sigmask() failed, error=" << error << "\n";
+        return 1;
+    }
 
     tiny_http::ServerConfig config;
 
@@ -80,7 +93,6 @@ int main(int argc, char* argv[])
     // 第4步：启动服务器
     // ========================================================
     tiny_http::LinuxHttpServer server(config);
-    g_server = &server;
 
     if (!server.start()) {
         std::cerr << "启动失败！\n";
