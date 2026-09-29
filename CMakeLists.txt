@@ -52,3 +52,25 @@ enable_testing()
 
 add_test(NAME parser_tests COMMAND parser_tests)
 add_test(NAME config_parser_tests COMMAND config_parser_tests)
+
+add_executable(room_protocol_tests
+    tests/room_protocol_tests.cpp
+)
+
+target_include_directories(room_protocol_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+add_test(NAME room_protocol_tests COMMAND room_protocol_tests)
+
+add_executable(tiny_roomd
+    src/room_server.cpp
+)
+
+target_include_directories(tiny_roomd PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_compile_options(tiny_roomd PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic>
+)
