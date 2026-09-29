@@ -24,6 +24,9 @@ enum class MessageType : std::uint16_t {
     RoomMessage = 5,
     RoomBroadcast = 6,
 
+    LeaveRoom = 7,
+    LeaveRoomReply = 8,
+
     Error = 255
 };
 

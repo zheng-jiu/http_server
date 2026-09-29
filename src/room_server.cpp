@@ -251,6 +251,19 @@ private:
                         }
                         break;
                     
+                    case MessageType::LeaveRoom:
+                        if (!message.body.empty()) {
+                            response = {MessageType::Error, "leave request body must be empty"};
+                            break;
+                        }
+
+                        // 先保存原房间名，用于确认回复
+                        response = {MessageType::LeaveRoomReply, conn.room};
+
+                        // 只清除房间归属，保留 TCP 连接
+                        conn.room.clear();
+                        break;
+
                     case MessageType::RoomMessage:
                         if (conn.room.empty()) {
                             response = {MessageType::Error, "join a room first"};
