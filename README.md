@@ -498,7 +498,7 @@ server {
 | `proxy_pass` | 尚未实现反向代理 |
 | `expires` | 尚未实现缓存过期控制 |
 
-当前 `-c` 参数与位置参数覆盖逻辑存在冲突，使用默认配置文件路径和上述位置参数。
+通过 `-c <path>` 指定配置文件，可与位置参数组合使用；位置参数优先于配置文件。例如：`./build/tiny_httpd -c custom.conf 8082 ./public 8`，加载 `custom.conf` 后，将端口改为 8082、静态目录改为 `./public`、工作线程数改为 8。
 
 房间协议的 64 KiB 正文上限是独立的协议限制，与 HTTP 配置中的 max_body_size 无关。
 

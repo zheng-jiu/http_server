@@ -472,15 +472,27 @@ ServerConfig parse_config_file(const std::string& file_path) {
 
 // 命令行参数覆盖配置值
 void apply_command_line(ServerConfig& config, int argc, char* argv[]) {
+    char* positional[3] {};
+    int count = 0;
+
+    for (int i = 1; i < argc && count < 3; ++i) {
+        if (std::string(argv[i]) == "-c") {
+            ++i;  // 同时跳过配置文件路径
+            continue;
+        }
+        positional[count++] = argv[i];
+    }
+    
     // 位置参数：[port] [document_root] [worker_threads]
-    if (argc >= 2) {
-        config.port = std::atoi(argv[1]);
+    if (count >= 1) {
+        config.port = std::atoi(positional[0]);
     }
-    if (argc >= 3) {
-        config.document_root = argv[2];
+    if (count >= 2) {
+        config.document_root = positional[1];
     }
-    if (argc >= 4) {
-        config.worker_threads = static_cast<std::size_t>(std::atoi(argv[3]));
+    if (count >= 3) {
+        config.worker_threads =
+            static_cast<std::size_t>(std::atoi(positional[2]));
     }
 }
 
