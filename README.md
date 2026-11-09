@@ -25,6 +25,7 @@ HTTP 服务器使用线程池、eventfd 和 sendfile；房间服务使用单线�
 
 - **事件驱动网络通信**：非阻塞 Socket、epoll ET、多客户端连接接入及读写事件处理。
 - **HTTP 解析**：支持 HTTP/1.0 / HTTP/1.1 请求行、请求头及基于 Content-Length 的请求体解析，区分完整请求、不完整请求和格式错误。
+- **请求校验与资源限制**：拒绝 Transfer-Encoding、重复或非法的 Content-Length；限制请求头大小和请求体大小；连接输入缓冲区超限、线程池排队任务超限（返回 503）或发送长时间无进展时关闭连接。
 - **基础请求处理**：GET / HEAD、Keep-Alive、HTTP 状态码和响应头生成。
 - **静态资源服务**：文档根目录、默认首页、MIME 类型映射、查询字符串剥离及基础路径检查。
 - **线程协作**：I/O 线程维护 Connection、客户端 Socket 和 epoll 状态；worker 处理请求，通过线程安全完成队列与 eventfd 返回结果。
@@ -472,6 +473,8 @@ server {
     log_level info;
 
     max_body_size 1048576;
+    max_pending_tasks 256;
+    send_timeout 15;
 }
 ```
 
@@ -485,13 +488,15 @@ server {
 | `keep_alive` | 空闲连接超时秒数 |
 | `max_events` | 单次 epoll_wait 的事件数组容量，不是最大连接数 |
 | `log_path` | 日志文件路径 |
+| `max_body_size` | HTTP 请求体大小上限，超限时关闭连接 |
+| `max_pending_tasks` | 线程池最大排队任务数，超限返回 503 |
+| `send_timeout` | 发送连续无进展的超时秒数，超时关闭连接 |
 
 可解析但尚未接入对应运行逻辑：
 
 | 配置项 | 当前状态 |
 | --- | --- |
 | `log_level` | 尚未按配置控制日志过滤 |
-| `max_body_size` | 尚未按配置限制 HTTP 请求体大小 |
 | `rate_limit` | 尚未实现请求限流 |
 | `server_name` | 尚未实现按域名分发 |
 | `location` | 尚未接入请求路由 |
