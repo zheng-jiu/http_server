@@ -391,6 +391,25 @@ private:
             config.max_body_size = static_cast<std::size_t>(std::stoul(current_.value));
             expect(TokenType::Number);
 
+        } else if (name == "max_pending_tasks") {
+            config.max_pending_tasks = static_cast<std::size_t>(
+                std::stoul(current_.value));
+
+            if (config.max_pending_tasks == 0) {
+                error("max_pending_tasks 必须大于 0");
+            }
+
+            expect(TokenType::Number);
+
+        } else if (name == "send_timeout") {
+            config.send_timeout_seconds = std::stoi(current_.value);
+
+            if (config.send_timeout_seconds <= 0) {
+                error("send_timeout 必须大于 0");
+            }
+
+            expect(TokenType::Number);
+
         } else if (name == "rate_limit") {
             config.rate_limit = std::stoi(current_.value);
             expect(TokenType::Number);

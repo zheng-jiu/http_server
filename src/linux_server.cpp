@@ -16,6 +16,7 @@
 #include <vector>
 #include <cerrno>
 #include <chrono>
+#include <limits>
 
 namespace tiny_http {
 
@@ -582,6 +583,13 @@ std::string LinuxHttpServer::map_target_to_path(const std::string& target)
 
 void LinuxHttpServer::switch_to_epollout(int fd)
 {
+    auto it = connections_.find(fd);
+    if (it == connections_.end()) {
+        return;
+    }
+
+    it->second.last_write_ms = now_ms();
+
     epoll_event event{};
     event.events = EPOLLOUT | EPOLLRDHUP | EPOLLET; // 关注可写 + 对端关闭 + 边缘触发
     event.data.fd = fd;
@@ -645,7 +653,7 @@ bool LinuxHttpServer::try_submit_next_request(int fd) {
 
     const std::uint64_t connection_id = conn.id;
 
-    thread_pool_.submit(
+    const bool accepted = thread_pool_.submit(
         [this, fd, connection_id, raw = std::move(raw)] {
             ResponseResult result = process_request(fd, connection_id, raw);
 
@@ -661,8 +669,23 @@ bool LinuxHttpServer::try_submit_next_request(int fd) {
                     + std::to_string(errno)
                 );
             }
-        }
+        },
+        config_.max_pending_tasks
     );
+
+    if (!accepted) {
+        HttpResponse response(503, "Service Unavailable");
+        response.set_body("Server busy\n");
+        response.set_keep_alive(false);
+
+        conn.out = response.serialize();
+        conn.close_after_write = true;
+        conn.rejecting = true;
+        conn.in.clear();
+
+        switch_to_epollout(fd);
+        return false;
+    }
 
     return true;
 }
@@ -677,6 +700,16 @@ void LinuxHttpServer::handle_read(int fd)
     }
     Connection& conn = it->second;
 
+    if (conn.rejecting) {
+        return;
+    }
+
+    const std::size_t max_size = std::numeric_limits<std::size_t>::max();
+
+    const std::size_t input_limit = 
+        config_.max_body_size > max_size - 8192
+            ? max_size : config_.max_body_size + 8192;
+
     char buffer[4096];  // 临时接收缓冲区
 
     // ===== 外层循环：recv 直到内核缓冲区空 =====
@@ -684,8 +717,16 @@ void LinuxHttpServer::handle_read(int fd)
         const ssize_t n = ::recv(fd, buffer, sizeof(buffer), 0);
 
         if (n > 0) {
+            const std::size_t incoming = static_cast<std::size_t>(n);
+
+            if (conn.in.size() > input_limit ||
+                incoming > input_limit - conn.in.size()) {
+                close_connection(fd);
+                return;
+            }
+            
             // 读到了数据，追加到输入缓冲区
-            conn.in.append(buffer, static_cast<std::size_t>(n));
+            conn.in.append(buffer, incoming);
             conn.last_active_ms = now_ms(); // 更新活跃时间
 
             // 尝试提交一个请求
@@ -738,6 +779,7 @@ void LinuxHttpServer::handle_write(int fd)
             conn.out.erase(0, static_cast<std::size_t>(n));
 
             conn.last_active_ms = now_ms();
+            conn.last_write_ms = conn.last_active_ms;
             continue;
         }
 
@@ -762,6 +804,7 @@ void LinuxHttpServer::handle_write(int fd)
             conn.file_remaining -= static_cast<std::size_t>(n);
 
             conn.last_active_ms = now_ms();
+            conn.last_write_ms = conn.last_active_ms;
             continue;
         }
 
@@ -882,13 +925,22 @@ void LinuxHttpServer::sweep_idle_connections()
 {
     const long long now = now_ms();
     const long long timeout_ms = static_cast<long long>(config_.keep_alive_seconds) * 1000;
+    const long long send_timeout_ms = static_cast<long long>(config_.send_timeout_seconds) * 1000;
 
     // 先收集待关闭的 fd（不能在遍历 map 的同时删除元素）
     std::vector<int> to_close;
     for (const auto& [fd, conn] : connections_) {
+        const bool sending = !conn.out.empty() || conn.file_remaining > 0;
+
+        if (sending && now - conn.last_write_ms >= send_timeout_ms) {
+            to_close.push_back(fd);
+            continue;
+        }
+
         if (conn.processing) {
             continue;  // 正在处理中，不关闭
         }
+
         if (now - conn.last_active_ms > timeout_ms) {
             to_close.push_back(fd);
         }
@@ -896,9 +948,9 @@ void LinuxHttpServer::sweep_idle_connections()
 
     // 统一关闭
     for (int fd : to_close) {
-        logger_.log(LogLevel::Info,
-                    "超时关闭 fd=" + std::to_string(fd)
-                    + " 空闲=" + std::to_string(now - connections_[fd].last_active_ms) + "ms");
+        logger_.log(
+            LogLevel::Info,
+            "连接超时关闭 fd=" + std::to_string(fd));
         close_connection(fd);
     }
 }

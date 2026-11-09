@@ -4,13 +4,14 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <cstddef>
 
 namespace tiny_http {
 
 template <typename T>
 class BlockingQueue {
 public:
-    // 向队列添加任务
+    // 向队列添加结果（无容量限制）
     void push(T value)
     {
         {
@@ -21,6 +22,23 @@ public:
             queue_.push(std::move(value));
         }   // 离开作用域，自动释放锁
         cv_.notify_one();  // 唤醒一个等待任务的工作线程
+    }
+
+    // 尝试向队列添加任务（队列满则返回 false）
+    bool try_push(T value, std::size_t max_size)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+
+            if (closed_ || queue_.size() >= max_size) {
+                return false;
+            }
+
+            queue_.push(std::move(value));
+        }
+
+        cv_.notify_one();
+        return true;
     }
 
     // 从队列取出任务（阻塞等待）

@@ -15,9 +15,9 @@ ThreadPool::~ThreadPool()
     stop();
 }
 
-void ThreadPool::submit(Task task)
+bool ThreadPool::submit(Task task, std::size_t max_pending_tasks)
 {
-    tasks_.push(std::move(task));
+    return tasks_.try_push(std::move(task), max_pending_tasks);
 }
 
 void ThreadPool::stop()

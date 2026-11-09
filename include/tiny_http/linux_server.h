@@ -58,7 +58,9 @@ private:
 
         bool close_after_write {true};
         bool processing {false};
+        bool rejecting {false};
         long long last_active_ms {0};
+        long long last_write_ms {0};
     };
 
 private:
@@ -111,7 +113,7 @@ private:
 
     BlockingQueue<ResponseResult> completion_queue_;
 
-    HttpParser parser_;
+    HttpParser parser_ {config_.max_body_size};
     ThreadPool thread_pool_ {config_.worker_threads};
     AsyncLogger logger_;
 };

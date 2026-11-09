@@ -21,7 +21,7 @@ public:
     ThreadPool& operator=(const ThreadPool&) = delete;
 
     // 提交任务
-    void submit(Task task);
+    bool submit(Task task, std::size_t max_pending_tasks = 256);
 
     // 停止所有线程
     void stop();

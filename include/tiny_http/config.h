@@ -34,6 +34,8 @@ struct ServerConfig {
     std::vector<VirtualHost> virtual_hosts; // 虚拟主机列表
     std::vector<LocationRule> locations; // location 规则列表
     std::size_t max_body_size {1048576}; // 最大请求体大小（默认 1MB)
+    std::size_t max_pending_tasks {256}; // 线程池最大排队任务数
+    int send_timeout_seconds {15}; // 连续无发送进展的超时时间（秒）
     int rate_limit {0}; // 每秒最大请求数（0 = 不限制）
 };
 

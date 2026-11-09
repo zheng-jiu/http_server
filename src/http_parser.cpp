@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cctype>
 #include <sstream>
+#include <charconv>
+#include <system_error>
 
 namespace tiny_http {
 
@@ -71,6 +73,14 @@ bool HttpParser::parse_header_line(const std::string& line, HttpRequest& request
         error = "empty header key";
         return false;
     }
+    if (key == "transfer-encoding") {
+        error = "Transfer-Encoding is not supported";
+        return false;
+    }
+    if (key == "content-length" && request.headers.find(key) != request.headers.end()) {
+        error = "duplicate Content-Length";
+        return false;
+    }
     request.headers[key] = value;
     return true;
 }
@@ -83,6 +93,11 @@ ParseResult HttpParser::parse(const std::string& buffer) const {
             result.status = ParseStatus::BadRequest;
             result.error = "request header is too large";
         }
+        return result;
+    }
+    if (header_end + 4 > 8192) {
+        result.status = ParseStatus::BadRequest;
+        result.error = "request header is too large";
         return result;
     }
 
@@ -118,18 +133,32 @@ ParseResult HttpParser::parse(const std::string& buffer) const {
 
     std::size_t body_start = header_end + 4;
     std::size_t content_length = 0;
-    const std::string content_length_text = result.request.header("Content-Length");
-    if (!content_length_text.empty()) {
-        try {
-            content_length = static_cast<std::size_t>(std::stoul(content_length_text));
-        } catch (...) {
+
+    const auto it = result.request.headers.find("content-length");
+
+    if (it != result.request.headers.end()) {
+        const std::string& text = it->second;
+        const char* begin = text.data();
+        const char* end = begin + text.size();
+
+        const auto [ptr, ec] = std::from_chars(
+            begin, end, content_length);
+
+        if (ec != std::errc{} || ptr != end) {
             result.status = ParseStatus::BadRequest;
             result.error = "invalid Content-Length";
             return result;
         }
     }
 
-    if (buffer.size() < body_start + content_length) {
+    // 先检查客户端声明的正文长度是否超过配置上限
+    if (content_length > max_body_size_) {
+        result.status = ParseStatus::BadRequest;
+        result.error = "request body is too large";
+        return result;
+    }
+
+    if (content_length > buffer.size() - body_start) {
         result.status = ParseStatus::Incomplete;
         return result;
     }
