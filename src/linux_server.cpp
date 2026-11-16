@@ -260,6 +260,18 @@ bool LinuxHttpServer::start()
                 continue;
             }
 
+            // 后端连接事件
+            if (upstreams_.contains(fd)) {
+                handle_upstream(fd, flags);
+                continue;
+            }
+
+            // 客户端连接发生错误或完全挂断
+            if ((flags & (EPOLLERR | EPOLLHUP)) != 0) {
+                close_connection(fd);
+                continue;
+            }
+
             // 客户端 fd ，可读
             if ((flags & EPOLLIN) != 0) {
                 handle_read(fd);
@@ -299,6 +311,10 @@ void LinuxHttpServer::stop()
         if (result->file_fd >= 0) {
             ::close(result->file_fd);
         }
+    }
+
+    while (!upstreams_.empty()) {
+        close_upstream(upstreams_.begin()->first);
     }
 
     // 关闭所有客户端连接
@@ -404,26 +420,28 @@ void LinuxHttpServer::accept_clients()
 
 void LinuxHttpServer::close_connection(int fd)
 {
-    std::unordered_map<int, Connection>::iterator it = connections_.find(fd);
+    auto it = connections_.find(fd);
 
-    if (it != connections_.end()) {
-        if (it->second.file_fd >= 0) {
-            ::close(it->second.file_fd);
-            it->second.file_fd = -1;
-        }
+    if (it == connections_.end()) {
+        return;
     }
 
-    // 从 epoll 移除
-    ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+    close_upstream(it->second.upstream_fd);
 
-    // 关闭客户端 socket
+    if (it->second.file_fd >= 0) {
+        ::close(it->second.file_fd);
+    }
+
+    ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
     ::close(fd);
 
-    // 删除连接状态
-    connections_.erase(fd);
+    connections_.erase(it);
 
-    logger_.log(LogLevel::Info, "连接关闭 fd=" + std::to_string(fd)
-                + " 剩余连接数=" + std::to_string(connections_.size()));
+    logger_.log(
+        LogLevel::Info,
+        "连接关闭 fd=" + std::to_string(fd)
+        + " 剩余连接数=" + std::to_string(connections_.size())
+    );
 }
 
 // ---- 处理请求并生成响应 ----
@@ -619,6 +637,26 @@ void LinuxHttpServer::switch_to_epollin(int fd)
     }
 }
 
+const LocationRule* LinuxHttpServer::match_location(
+    const std::string& target) const
+{
+    const std::string path =
+        target.substr(0, target.find('?'));
+
+    const LocationRule* matched = nullptr;
+
+    for (const LocationRule& rule : config_.locations) {
+        if (!rule.path.empty() &&
+            path.starts_with(rule.path) &&
+            (matched == nullptr ||
+             rule.path.size() > matched->path.size())) {
+            matched = &rule;
+        }
+    }
+
+    return matched;
+}
+
 bool LinuxHttpServer::try_submit_next_request(int fd) {
     std::unordered_map<int, Connection>::iterator it = connections_.find(fd);
     if (it == connections_.end()) {
@@ -640,6 +678,14 @@ bool LinuxHttpServer::try_submit_next_request(int fd) {
 
     if (parsed.status == ParseStatus::BadRequest) {
         close_connection(fd);
+        return false;
+    }
+
+    const LocationRule* location =
+        match_location(parsed.request.target);
+
+    if (location != nullptr && !location->proxy_pass.empty()) {
+        start_proxy(fd, parsed.request, *location);
         return false;
     }
 
@@ -926,6 +972,18 @@ void LinuxHttpServer::sweep_idle_connections()
     const long long now = now_ms();
     const long long timeout_ms = static_cast<long long>(config_.keep_alive_seconds) * 1000;
     const long long send_timeout_ms = static_cast<long long>(config_.send_timeout_seconds) * 1000;
+
+    std::vector<int> proxy_timeouts;
+
+    for (const auto& [fd, upstream] : upstreams_) {
+        if (now - upstream.started_ms >= proxy_timeout_ms_) {
+            proxy_timeouts.push_back(upstream.client_fd);
+        }
+    }
+
+    for (int client_fd : proxy_timeouts) {
+        fail_proxy(client_fd, 504, "Gateway Timeout");
+    }    
 
     // 先收集待关闭的 fd（不能在遍历 map 的同时删除元素）
     std::vector<int> to_close;

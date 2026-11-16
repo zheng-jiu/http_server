@@ -11,6 +11,7 @@ add_library(tiny_http_core
     src/http_response.cpp
     src/mime_types.cpp
     src/linux_server.cpp
+    src/http_proxy.cpp
     src/thread_pool.cpp
     src/async_logger.cpp
     src/config_parser.cpp
