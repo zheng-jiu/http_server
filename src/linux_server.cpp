@@ -982,7 +982,7 @@ void LinuxHttpServer::sweep_idle_connections()
     }
 
     for (int client_fd : proxy_timeouts) {
-        fail_proxy(client_fd, 504, "Gateway Timeout");
+        fail_proxy(client_fd, 504, "Gateway Timeout", true);
     }    
 
     // 先收集待关闭的 fd（不能在遍历 map 的同时删除元素）

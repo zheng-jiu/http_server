@@ -95,6 +95,48 @@ bool valid_field(const std::string& name, const std::string& value)
 
 } // namespace
 
+const std::string* LinuxHttpServer::select_backend(const LocationRule& location)
+{
+    const std::vector<std::string>& backends = location.proxy_pass;
+
+    if (backends.empty()) {
+        return nullptr;
+    }
+
+    std::size_t& next = next_backend_[location.path];
+    next %= backends.size();
+
+    const long long now = proxy_now_ms();
+
+    // 最多检查一轮，跳过仍在冷却中的后端
+    for (std::size_t checked = 0; checked < backends.size(); ++checked) {
+        const std::size_t index = next;
+        next = (next + 1) % backends.size();
+
+        const std::string& url = backends[index];
+        const auto it = backend_retry_at_.find(url);
+
+        if (it != backend_retry_at_.end() && now < it->second) {
+            continue;
+        }
+
+        return &url;
+    }
+
+    return nullptr;
+}
+
+void LinuxHttpServer::mark_backend_failed(const std::string& url)
+{
+    backend_retry_at_[url] = proxy_now_ms() + backend_cooldown_ms_;
+
+    logger_.log(
+        LogLevel::Warn,
+        "后端进入冷却 " + url + "，持续 "
+        + std::to_string(backend_cooldown_ms_) + " ms"
+    );
+}
+
 void LinuxHttpServer::start_proxy(
     int client_fd,
     const HttpRequest& request,
@@ -116,7 +158,14 @@ void LinuxHttpServer::start_proxy(
         return;
     }
 
-    const std::string& url = location.proxy_pass;
+    const std::string* selected = select_backend(location);
+
+    if (selected == nullptr) {
+        fail_proxy(client_fd, 503, "Service Unavailable");
+        return;
+    }
+
+    const std::string& url = *selected;
 
     if (!url.starts_with("http://")) {
         fail_proxy(client_fd, 502, "Bad Gateway");
@@ -158,6 +207,7 @@ void LinuxHttpServer::start_proxy(
     Upstream upstream;
     upstream.client_fd = client_fd;
     upstream.client_id = conn.id;
+    upstream.backend_url = url;
     upstream.head_request = request.method == "HEAD";
     upstream.started_ms = proxy_now_ms();
 
@@ -210,6 +260,7 @@ void LinuxHttpServer::start_proxy(
 
     if (result < 0 && errno != EINPROGRESS) {
         ::close(fd);
+        mark_backend_failed(url);
         fail_proxy(client_fd, 502, "Bad Gateway");
         return;
     }
@@ -402,9 +453,13 @@ void LinuxHttpServer::handle_upstream(
                 SOL_SOCKET,
                 SO_ERROR,
                 &error,
-                &length) < 0 ||
-            error != 0) {
+                &length) < 0) {
             fail_proxy(client_fd, 502, "Bad Gateway");
+            return;
+        }
+
+        if (error != 0) {
+            fail_proxy(client_fd, 502, "Bad Gateway", true);
             return;
         }
 
@@ -434,7 +489,7 @@ void LinuxHttpServer::handle_upstream(
             return;
         }
 
-        fail_proxy(client_fd, 502, "Bad Gateway");
+        fail_proxy(client_fd, 502, "Bad Gateway", true);
         return;
     }
 
@@ -519,7 +574,7 @@ void LinuxHttpServer::handle_upstream(
                 !upstream.content_length.has_value()) {
                 finish_proxy(fd);
             } else {
-                fail_proxy(client_fd, 502, "Bad Gateway");
+                fail_proxy(client_fd, 502, "Bad Gateway", true);
             }
 
             return;
@@ -533,7 +588,7 @@ void LinuxHttpServer::handle_upstream(
             return;
         }
 
-        fail_proxy(client_fd, 502, "Bad Gateway");
+        fail_proxy(client_fd, 502, "Bad Gateway", true);
         return;
     }
 }
@@ -595,12 +650,23 @@ void LinuxHttpServer::finish_proxy(int upstream_fd)
 void LinuxHttpServer::fail_proxy(
     int client_fd,
     int status,
-    const std::string& reason)
+    const std::string& reason,
+    bool backend_failure)
 {
     auto it = connections_.find(client_fd);
 
     if (it == connections_.end()) {
         return;
+    }
+
+    // 先记录故障节点，再释放后端连接
+    if (backend_failure) {
+        const auto upstream = upstreams_.find(it->second.upstream_fd);
+
+        if (upstream != upstreams_.end() &&
+            upstream->second.client_id == it->second.id) {
+            mark_backend_failed(upstream->second.backend_url);
+        }
     }
 
     close_upstream(it->second.upstream_fd);

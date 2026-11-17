@@ -70,6 +70,7 @@ private:
         int fd {-1};
         int client_fd {-1};
         std::uint64_t client_id {0};
+        std::string backend_url;  // 本次请求选中的后端地址
         bool connecting {true};
         bool head_request {false};
 
@@ -89,6 +90,7 @@ private:
     static constexpr std::size_t proxy_header_limit_ = 8192;
     static constexpr std::size_t proxy_body_limit_ = 8 * 1024 * 1024;
     static constexpr long long proxy_timeout_ms_ = 15000;
+    static constexpr long long backend_cooldown_ms_ = 10000;
 
 private:
     // ---- 私有函数 ----
@@ -125,6 +127,10 @@ private:
 
     const LocationRule* match_location(const std::string& target) const;
 
+    const std::string* select_backend(const LocationRule& location);
+
+    void mark_backend_failed(const std::string& url);
+
     void start_proxy(
         int client_fd,
         const HttpRequest& request,
@@ -140,7 +146,8 @@ private:
     void fail_proxy(
         int client_fd,
         int status,
-        const std::string& reason
+        const std::string& reason,
+        bool backend_failure = false
     );
 
     void close_upstream(int fd);
@@ -159,6 +166,13 @@ private:
 
     std::unordered_map<int, Connection> connections_;
     std::unordered_map<int, Upstream> upstreams_;
+
+    // 每条 location 规则下一次轮询的位置
+    std::unordered_map<std::string, std::size_t> next_backend_;
+
+    // 后端地址对应的冷却截止时间（毫秒）
+    std::unordered_map<std::string, long long> backend_retry_at_;
+
     std::uint64_t next_connection_id_ {1};
 
     BlockingQueue<ResponseResult> completion_queue_;

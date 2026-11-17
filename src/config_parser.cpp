@@ -318,7 +318,7 @@ private:
 
             } else if (current_.type == TokenType::Keyword && current_.value == "proxy_pass") {
                 expect(TokenType::Keyword);  // 消费 "proxy_pass"
-                loc.proxy_pass = current_.value;
+                loc.proxy_pass.push_back(current_.value);
                 if (current_.type == TokenType::String) {
                     expect(TokenType::String);
                 } else {

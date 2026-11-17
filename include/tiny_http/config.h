@@ -11,7 +11,7 @@ namespace tiny_http {
 struct LocationRule {
     std::string path; // 匹配路径，如 "/api/"
     std::string root; // 可选：替代 document_root
-    std::string proxy_pass; // 可选：反向代理目标 URL
+    std::vector<std::string> proxy_pass; // 可选：反向代理目标 URL
     std::string expires; // 可选：缓存过期时间，如 "7d"、"1h"
 };
 

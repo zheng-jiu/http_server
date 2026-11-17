@@ -96,7 +96,9 @@ int main() {
         if (config.locations.size() >= 2) {
             check(config.locations[0].path == "/api/",
                   "location[0] path = /api/");
-            check(config.locations[0].proxy_pass == "http://localhost:5000",
+            check(
+                config.locations[0].proxy_pass.size() == 1 &&
+                config.locations[0].proxy_pass.front() == "http://localhost:5000",
                   "location[0] proxy_pass");
             check(config.locations[1].path == "/static/",
                   "location[1] path = /static/");

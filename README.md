@@ -1,6 +1,6 @@
 # TinyHttpServer
 
-基于 C++20 和 Linux 实现的 HTTP 服务器，支持静态资源访问和单后端反向代理。
+基于 C++20 和 Linux 实现的 HTTP 服务器，支持静态资源访问、多后端反向代理、轮询负载均衡与故障冷却恢复。
 
 采用单 Reactor + 工作线程池架构：I/O 线程通过 epoll 管理客户端与后端连接，工作线程处理静态文件请求，异步日志线程负责日志写入。
 
@@ -15,16 +15,19 @@
 - 校验请求头大小、请求体大小、Content-Length 格式及重复声明。
 - 工作线程池采用有界任务队列，排队任务达到上限时返回 503。
 
-### 单后端反向代理
+### 多后端反向代理与负载均衡
 
-- 根据 location 规则进行最长路径前缀匹配，每条代理规则对应一个固定后端。
+- 根据 location 规则进行最长路径前缀匹配，每条规则可以配置多个后端。
+- 使用 Round Robin 轮询选择后端，跳过仍在冷却中的节点。
+- 后端连接或传输故障、交互超时后进入 10 秒冷却，到期后由实际请求触发恢复尝试。
 - 使用非阻塞 connect、send、recv 完成后端连接与请求转发。
 - 支持 GET、HEAD，保留原请求路径和查询参数。
 - 重写 Host，过滤逐跳头字段，保留多条 Set-Cookie 等重复响应头。
 - 向后端发送 HTTP/1.0 短连接请求，接收定长响应或通过关闭连接结束的响应。
 - 单独处理 HEAD、204、304 等无正文响应。
 - 收齐后端响应后重新组织响应头，通过现有客户端发送流程返回。
-- 后端连接失败、响应格式错误或定长正文截断时返回 502，后端交互超时返回 504。
+- 后端连接或传输失败、响应格式错误或定长正文截断时返回 502，后端交互超时返回 504。
+- 全部后端处于冷却状态时返回 503。
 
 ### 网络与连接管理
 
@@ -116,6 +119,7 @@ server {
 
     location /api/ {
         proxy_pass "http://127.0.0.1:9001";
+        proxy_pass "http://127.0.0.1:9002";
     }
 }
 ```
@@ -134,7 +138,7 @@ server {
 | `max_pending_tasks` | `256` | 工作线程池最大排队任务数 |
 | `send_timeout` | `15` | 向客户端发送时连续无进展的超时秒数 |
 | `location` | 空 | 按请求路径匹配规则 |
-| `proxy_pass` | 空 | 匹配规则对应的固定后端地址 |
+| `proxy_pass` | 空 | 后端地址；同一 location 内可重复配置多个地址，按轮询顺序选择 |
 
 配置解析器还保留了 `log_level`、`rate_limit`、`server_name`、location 内的 `root` 和 `expires` 语法，这些字段目前仅完成解析，对应功能尚未接入运行流程。
 
@@ -167,46 +171,91 @@ http://127.0.0.1:9001
 
 ## 反向代理运行示例
 
-确认 HTTP 配置中已启用 `/api/` 代理规则。
+本示例使用两个后端，分别监听 9001、9002，由 TinyHttpServer 在 8080 端口统一接收请求。
 
-在第一个终端准备一个示例后端：
+确认配置中的 `/api/` 规则包含以下两个地址：
+
+```nginx
+location /api/ {
+    proxy_pass "http://127.0.0.1:9001";
+    proxy_pass "http://127.0.0.1:9002";
+}
+```
+
+同一 location 内重复填写 proxy_pass，可以添加多个后端。配置修改后重启 TinyHttpServer 生效。
+
+### 启动两个后端
+
+终端 1：准备并启动后端 A。
 
 ```bash
-mkdir -p /tmp/tiny-http-backend/api
+mkdir -p /tmp/tiny-http-backend-a/api
 
-printf '{"service":"upstream","status":"ok"}\n' \
-    > /tmp/tiny-http-backend/api/info.json
+printf 'A' > /tmp/tiny-http-backend-a/api/node.txt
 
 python3 -m http.server 9001 \
     --bind 127.0.0.1 \
-    --directory /tmp/tiny-http-backend
+    --directory /tmp/tiny-http-backend-a
 ```
 
-在第二个终端启动 TinyHttpServer：
+终端 2：准备并启动后端 B。
+
+```bash
+mkdir -p /tmp/tiny-http-backend-b/api
+
+printf 'B' > /tmp/tiny-http-backend-b/api/node.txt
+
+python3 -m http.server 9002 \
+    --bind 127.0.0.1 \
+    --directory /tmp/tiny-http-backend-b
+```
+
+### 启动代理并访问
+
+终端 3：在仓库根目录启动 TinyHttpServer。
 
 ```bash
 ./build/tiny_httpd -c tiny_httpd.conf
 ```
 
-在第三个终端访问代理入口：
+终端 4：连续发送四个请求。
 
 ```bash
-curl --noproxy '*' -i http://127.0.0.1:8080/api/info.json
+for i in 1 2 3 4; do
+    printf '第 %s 次：' "$i"
+    curl --noproxy '*' -sS --max-time 20 \
+        -w ' HTTP %{http_code}\n' \
+        http://127.0.0.1:8080/api/node.txt
+done
 ```
 
-响应正文：
+刚启动代理且按上述顺序请求时，输出如下：
 
-```json
-{"service":"upstream","status":"ok"}
+```text
+第 1 次：A HTTP 200
+第 2 次：B HTTP 200
+第 3 次：A HTTP 200
+第 4 次：B HTTP 200
 ```
 
-访问静态首页仍然使用相同入口：
+### 观察故障摘除与恢复
+
+1. 在终端 1 按 Ctrl+C，停止后端 A。
+2. 在终端 4 再次执行四次请求命令。第一次选中 A 的请求返回 502，之后在冷却期间请求交给 B。
+3. 在终端 1 重新执行后端 A 的启动命令。
+4. 在终端 4 执行 `sleep 11`，等待冷却结束，再次发送请求，观察 A、B 恢复交替返回。
+
+停止两个后端后，访问各节点的请求会分别触发 502 并记录冷却。当两个节点都处于冷却状态时，新请求返回 503。
+
+### 访问静态资源
+
+静态首页继续使用相同入口：
 
 ```bash
 curl --noproxy '*' -i http://127.0.0.1:8080/
 ```
 
-请求 `/api/info.json` 时由后端提供内容；请求 `/` 时由 TinyHttpServer 提供本地静态首页。
+请求 `/api/node.txt` 时，由选中的后端提供内容；请求 `/` 时，由 TinyHttpServer 提供本地静态首页。
 
 ## 架构与请求流程
 
@@ -236,15 +285,31 @@ Connection 保存文件描述符、文件偏移和剩余长度。发送遇到 EA
 ### 代理请求
 
 1. I/O 线程解析请求，匹配包含 proxy_pass 的 location。
-2. 创建非阻塞后端 Socket，发起 connect。
-3. 连接处于 EINPROGRESS 状态时，等待就绪事件，通过 SO_ERROR 读取连接结果。
-4. 发送重新组织的 HTTP 请求，保存部分发送的进度。
-5. 请求发完后切换为关注后端可读事件。
-6. 解析后端响应头，判断正文结束条件并累积响应数据。
-7. 收齐响应后关闭后端 Socket，把响应交给客户端发送流程。
-8. 客户端响应发送完成后关闭连接。
+2. 按轮询顺序选择后端，跳过仍在冷却中的节点；全部节点处于冷却状态时返回 503。
+3. 创建非阻塞后端 Socket，发起 connect，并在 Upstream 中保存选中的后端地址。
+4. 连接处于 EINPROGRESS 状态时，等待就绪事件，通过 SO_ERROR 读取连接结果。
+5. 发送重新组织的 HTTP 请求，保存部分发送的进度。
+6. 请求发完后切换为关注后端可读事件。
+7. 解析后端响应头，判断正文结束条件并累积响应数据。
+8. 收齐响应后关闭后端 Socket，把响应交给客户端发送流程。
+9. 客户端响应发送完成后关闭连接。
 
 每个代理请求使用独立的后端连接。代理采用完整响应缓冲方式，静态资源请求继续支持 Keep-Alive。
+
+### 后端轮询与故障恢复
+
+- 每条 location 独立维护轮询位置，按配置顺序选择后端。
+- 同一个后端地址被多条规则引用时，共享冷却状态。
+- 连接失败、发送或接收故障、响应提前断开，以及后端交互超时，都会使对应节点进入 10 秒冷却。
+- 冷却期间，新请求跳过该节点；冷却到期后，节点重新获得被选择的资格，由实际请求触发恢复尝试。
+- 当前连接或传输故障请求返回 502，超时请求返回 504，后续请求选择其他可用节点。
+- 后端返回格式有效且完整的 HTTP 4xx、5xx 响应时，正常转发响应，节点继续参与轮询。
+
+轮询位置、冷却截止时间和后端连接状态统一由 I/O 线程维护。
+
+冷却时间由 `include/tiny_http/linux_server.h` 中的 `backend_cooldown_ms_` 控制，默认值为 `10000` 毫秒。
+
+配置中未启动的后端也会参与选择。请求访问该节点失败后进入冷却；冷却到期后再次被选中时，会重新尝试连接。
 
 ### 后端响应结束条件
 
@@ -276,7 +341,7 @@ Connection 和 Upstream 由 I/O 线程维护。工作线程通过 ResponseResult
 
 | 类型 | 默认值 | 计时范围 | 超时处理 |
 | --- | --- | --- | --- |
-| 后端超时 | 15 秒 | 建立后端连接、发送请求、接收完整响应的累计时间 | 关闭后端连接，向客户端返回 504 |
+| 后端超时 | 15 秒 | 建立后端连接、发送请求、接收完整响应的累计时间 | 关闭后端连接，将对应后端冷却 10 秒，向客户端返回 504 |
 | 发送超时 | 15 秒 | 向客户端发送时连续无进展的时间 | 关闭客户端连接并释放关联资源 |
 | 空闲超时 | 15 秒 | 未处于请求处理状态的客户端连接无收发活动的时间 | 清理客户端连接 |
 
@@ -315,7 +380,7 @@ Connection 和 Upstream 由 I/O 线程维护。工作线程通过 ResponseResult
 | --- | --- |
 | `src/main.cpp` | 程序入口、配置加载和信号设置 |
 | `src/linux_server.cpp` | epoll 事件循环、客户端收发、静态请求处理和连接清理 |
-| `src/http_proxy.cpp` | 后端建连、请求转发、响应解析和代理资源管理 |
+| `src/http_proxy.cpp` | 后端轮询、故障冷却、后端建连、请求转发、响应解析和代理资源管理 |
 | `src/http_parser.cpp` | HTTP 请求解析与长度校验 |
 | `src/http_response.cpp` | HTTP 响应生成 |
 | `src/config_parser.cpp` | 配置文件解析和命令行参数覆盖 |
