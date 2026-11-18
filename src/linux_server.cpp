@@ -317,6 +317,12 @@ void LinuxHttpServer::stop()
         close_upstream(upstreams_.begin()->first);
     }
 
+    for (auto& [url, pool] : backend_pools_) {
+        discard_idle_upstreams(pool);
+    }
+
+    backend_pools_.clear();
+
     // 关闭所有客户端连接
     for (auto& [fd, conn] : connections_) {
         ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
@@ -685,6 +691,7 @@ bool LinuxHttpServer::try_submit_next_request(int fd) {
         match_location(parsed.request.target);
 
     if (location != nullptr && !location->proxy_pass.empty()) {
+        conn.in.erase(0, parsed.consumed);
         start_proxy(fd, parsed.request, *location);
         return false;
     }
@@ -884,6 +891,7 @@ void LinuxHttpServer::handle_write(int fd)
     // 5. Keep-Alive：
     // 当前请求完整结束，允许处理同一连接的下一个请求
     conn.processing = false;
+    conn.rejecting = false;
 
     switch_to_epollin(fd);
 
@@ -970,6 +978,7 @@ void LinuxHttpServer::handle_completions()
 void LinuxHttpServer::sweep_idle_connections()
 {
     const long long now = now_ms();
+    sweep_idle_upstreams(now);
     const long long timeout_ms = static_cast<long long>(config_.keep_alive_seconds) * 1000;
     const long long send_timeout_ms = static_cast<long long>(config_.send_timeout_seconds) * 1000;
 

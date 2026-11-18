@@ -93,7 +93,67 @@ bool valid_field(const std::string& name, const std::string& value)
     return true;
 }
 
+// 空闲 Socket 有待读数据、EOF 或错误时，丢弃
+bool idle_socket_is_usable(int fd)
+{
+    char byte;
+
+    while (true) {
+        const ssize_t n = ::recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+
+        if (n >= 0) {
+            return false;
+        }
+
+        if (errno != EINTR) {
+            return errno == EAGAIN || errno == EWOULDBLOCK;
+        }
+    }
+}
+
 } // namespace
+
+int LinuxHttpServer::take_idle_upstream(BackendPool& pool)
+{
+    const long long now = proxy_now_ms();
+
+    while (!pool.idle.empty()) {
+        const IdleUpstream idle = pool.idle.back();
+        pool.idle.pop_back();
+
+        if (now - idle.idle_since_ms < backend_idle_timeout_ms_ &&
+            idle_socket_is_usable(idle.fd)) {
+            return idle.fd;
+        }
+
+        ::close(idle.fd);
+    }
+
+    return -1;
+}
+
+void LinuxHttpServer::discard_idle_upstreams(BackendPool& pool)
+{
+    for (const IdleUpstream& idle : pool.idle) {
+        ::close(idle.fd);
+    }
+
+    pool.idle.clear();
+}
+
+void LinuxHttpServer::sweep_idle_upstreams(long long now)
+{
+    for (auto& [url, pool] : backend_pools_) {
+        std::erase_if(pool.idle, [now](const IdleUpstream& idle) {
+            if (now - idle.idle_since_ms < backend_idle_timeout_ms_) {
+                return false;
+            }
+
+            ::close(idle.fd);
+            return true;
+        });
+    }
+}
 
 const std::string* LinuxHttpServer::select_backend(const LocationRule& location)
 {
@@ -108,7 +168,7 @@ const std::string* LinuxHttpServer::select_backend(const LocationRule& location)
 
     const long long now = proxy_now_ms();
 
-    // 最多检查一轮，跳过仍在冷却中的后端
+    // 最多检查一轮，跳过冷却中或连接已用满的后端
     for (std::size_t checked = 0; checked < backends.size(); ++checked) {
         const std::size_t index = next;
         next = (next + 1) % backends.size();
@@ -117,6 +177,13 @@ const std::string* LinuxHttpServer::select_backend(const LocationRule& location)
         const auto it = backend_retry_at_.find(url);
 
         if (it != backend_retry_at_.end() && now < it->second) {
+            continue;
+        }
+
+        const auto pool = backend_pools_.find(url);
+
+        if (pool != backend_pools_.end() &&
+            pool->second.busy >= backend_connection_limit_) {
             continue;
         }
 
@@ -129,6 +196,12 @@ const std::string* LinuxHttpServer::select_backend(const LocationRule& location)
 void LinuxHttpServer::mark_backend_failed(const std::string& url)
 {
     backend_retry_at_[url] = proxy_now_ms() + backend_cooldown_ms_;
+
+    const auto pool = backend_pools_.find(url);
+
+    if (pool != backend_pools_.end()) {
+        discard_idle_upstreams(pool->second);
+    }
 
     logger_.log(
         LogLevel::Warn,
@@ -149,9 +222,9 @@ void LinuxHttpServer::start_proxy(
 
     Connection& conn = it->second;
     conn.processing = true;
-    conn.rejecting = true;
-    conn.close_after_write = true;
-    conn.in.clear();
+    conn.rejecting = true; // 等待本次代理响应，暂停读取客户端
+    conn.close_after_write =
+        request.version != "HTTP/1.1" || !request.keep_alive();
 
     if (request.method != "GET" && request.method != "HEAD") {
         fail_proxy(client_fd, 405, "Method Not Allowed");
@@ -212,7 +285,7 @@ void LinuxHttpServer::start_proxy(
     upstream.started_ms = proxy_now_ms();
 
     upstream.out =
-        request.method + " " + request.target + " HTTP/1.0\r\n";
+        request.method + " " + request.target + " HTTP/1.1\r\n";
 
     const auto omitted = hop_headers(request.header("Connection"));
 
@@ -238,37 +311,46 @@ void LinuxHttpServer::start_proxy(
                       + std::to_string(request.body.size()) + "\r\n";
     }
 
-    upstream.out += "Connection: close\r\n\r\n";
+    upstream.out += "\r\n";
     upstream.out += request.body;
 
-    const int fd = ::socket(
-        AF_INET,
-        SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
-        0
-    );
+    BackendPool& pool = backend_pools_[url];
+    int fd = take_idle_upstream(pool);
 
-    if (fd < 0) {
-        fail_proxy(client_fd, 502, "Bad Gateway");
-        return;
-    }
+    if (fd >= 0) {
+        upstream.connecting = false;
+        upstream.reused = true;
+    } else {
+        fd = ::socket(
+            AF_INET,
+            SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+            0
+        );
 
-    const int result = ::connect(
-        fd,
-        reinterpret_cast<sockaddr*>(&address),
-        sizeof(address)
-    );
+        if (fd < 0) {
+            fail_proxy(client_fd, 502, "Bad Gateway");
+            return;
+        }
 
-    if (result < 0 && errno != EINPROGRESS) {
-        ::close(fd);
-        mark_backend_failed(url);
-        fail_proxy(client_fd, 502, "Bad Gateway");
-        return;
+        const int result = ::connect(
+            fd,
+            reinterpret_cast<sockaddr*>(&address),
+            sizeof(address)
+        );
+
+        if (result < 0 && errno != EINPROGRESS) {
+            ::close(fd);
+            mark_backend_failed(url);
+            fail_proxy(client_fd, 502, "Bad Gateway");
+            return;
+        }
+
+        upstream.connecting = result < 0;
     }
 
     upstream.fd = fd;
-    upstream.connecting = result < 0;
-
     upstreams_.emplace(fd, std::move(upstream));
+    ++pool.busy;
     conn.upstream_fd = fd;
 
     // 当前客户端请求已经收全，等待后端响应
@@ -406,6 +488,7 @@ bool LinuxHttpServer::parse_upstream_headers(Upstream& upstream)
         "HTTP/1.1 " + code + " " + trim_ows(reason) + "\r\n";
 
     const auto omitted = hop_headers(connection);
+    upstream.keep_alive = version == "HTTP/1.1" && !omitted.contains("close");
 
     for (const auto& [name, value] : headers) {
         if (name == "content-length" || omitted.contains(name)) {
@@ -489,7 +572,8 @@ void LinuxHttpServer::handle_upstream(
             return;
         }
 
-        fail_proxy(client_fd, 502, "Bad Gateway", true);
+        const bool backend_failure = !upstream.reused || upstream.sent != 0;
+        fail_proxy(client_fd, 502, "Bad Gateway", backend_failure);
         return;
     }
 
@@ -553,9 +637,16 @@ void LinuxHttpServer::handle_upstream(
             const std::size_t received =
                 upstream.in.size() - upstream.header_size;
 
+            if ((upstream.no_body && received != 0) ||
+                (!upstream.no_body && upstream.content_length.has_value() &&
+                 received > *upstream.content_length)) {
+                fail_proxy(client_fd, 502, "Bad Gateway");
+                return;
+            }
+
             if (upstream.no_body ||
                 (upstream.content_length.has_value() &&
-                 received >= *upstream.content_length)) {
+                 received == *upstream.content_length)) {
                 finish_proxy(fd);
                 return;
             }
@@ -574,7 +665,9 @@ void LinuxHttpServer::handle_upstream(
                 !upstream.content_length.has_value()) {
                 finish_proxy(fd);
             } else {
-                fail_proxy(client_fd, 502, "Bad Gateway", true);
+                const bool backend_failure =
+                    !upstream.reused || !upstream.in.empty();
+                fail_proxy(client_fd, 502, "Bad Gateway", backend_failure);
             }
 
             return;
@@ -588,7 +681,8 @@ void LinuxHttpServer::handle_upstream(
             return;
         }
 
-        fail_proxy(client_fd, 502, "Bad Gateway", true);
+        const bool backend_failure = !upstream.reused || !upstream.in.empty();
+        fail_proxy(client_fd, 502, "Bad Gateway", backend_failure);
         return;
     }
 }
@@ -633,7 +727,9 @@ void LinuxHttpServer::finish_proxy(int upstream_fd)
                   + "\r\n";
     }
 
-    response += "Connection: close\r\n\r\n";
+    response += client->second.close_after_write
+        ? "Connection: close\r\n\r\n"
+        : "Connection: keep-alive\r\n\r\n";
 
     response.append(
         upstream.in,
@@ -643,7 +739,10 @@ void LinuxHttpServer::finish_proxy(int upstream_fd)
 
     client->second.out = std::move(response);
 
-    close_upstream(upstream_fd);
+    const bool reusable = upstream.keep_alive &&
+        (upstream.no_body || upstream.content_length.has_value());
+
+    release_upstream(upstream_fd, reusable);
     switch_to_epollout(client_fd);
 }
 
@@ -673,7 +772,7 @@ void LinuxHttpServer::fail_proxy(
 
     HttpResponse response(status, reason);
     response.set_body("");
-    response.set_keep_alive(false);
+    response.set_keep_alive(!it->second.close_after_write);
 
     if (status == 405) {
         response.set_header("Allow", "GET, HEAD");
@@ -682,8 +781,6 @@ void LinuxHttpServer::fail_proxy(
     it->second.out = response.serialize();
     it->second.processing = true;
     it->second.rejecting = true;
-    it->second.close_after_write = true;
-    it->second.in.clear();
 
     logger_.log(
         LogLevel::Warn,
@@ -694,7 +791,7 @@ void LinuxHttpServer::fail_proxy(
     switch_to_epollout(client_fd);
 }
 
-void LinuxHttpServer::close_upstream(int fd)
+void LinuxHttpServer::release_upstream(int fd, bool reusable)
 {
     auto it = upstreams_.find(fd);
 
@@ -702,18 +799,38 @@ void LinuxHttpServer::close_upstream(int fd)
         return;
     }
 
-    auto client = connections_.find(it->second.client_fd);
+    const Upstream& upstream = it->second;
+    auto client = connections_.find(upstream.client_fd);
 
     if (client != connections_.end() &&
-        client->second.id == it->second.client_id &&
+        client->second.id == upstream.client_id &&
         client->second.upstream_fd == fd) {
         client->second.upstream_fd = -1;
     }
 
-    ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-    ::close(fd);
+    BackendPool& pool = backend_pools_.at(upstream.backend_url);
+    --pool.busy;
+
+    const bool detached =
+        ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr) == 0;
+
+    const long long now = proxy_now_ms();
+    const auto retry = backend_retry_at_.find(upstream.backend_url);
+    const bool cooling =
+        retry != backend_retry_at_.end() && now < retry->second;
+
+    if (reusable && detached && !cooling && idle_socket_is_usable(fd)) {
+        pool.idle.push_back({fd, now});
+    } else {
+        ::close(fd);
+    }
 
     upstreams_.erase(it);
+}
+
+void LinuxHttpServer::close_upstream(int fd)
+{
+    release_upstream(fd, false);
 }
 
 } // namespace tiny_http

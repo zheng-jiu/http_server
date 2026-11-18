@@ -12,6 +12,7 @@
 #include <string>
 #include <unordered_map>
 #include <optional>
+#include <vector>
 
 namespace tiny_http {
 
@@ -73,6 +74,8 @@ private:
         std::string backend_url;  // 本次请求选中的后端地址
         bool connecting {true};
         bool head_request {false};
+        bool reused {false};       // 当前 Socket 来自连接池
+        bool keep_alive {false};   // 后端响应允许保持连接
 
         std::string out;            // 待发给后端的请求
         std::size_t sent {0};       // 已发送的请求字节数
@@ -87,10 +90,23 @@ private:
         long long started_ms {0};
     };
 
+    // 池里只保存空闲 Socket，使用中的 Socket 仍由 Upstream 管理
+    struct IdleUpstream {
+        int fd;
+        long long idle_since_ms;
+    };
+
+    struct BackendPool {
+        std::vector<IdleUpstream> idle;
+        std::size_t busy {0}; // 正在连接或处理请求的 Socket 数量
+    };
+
     static constexpr std::size_t proxy_header_limit_ = 8192;
     static constexpr std::size_t proxy_body_limit_ = 8 * 1024 * 1024;
     static constexpr long long proxy_timeout_ms_ = 15000;
     static constexpr long long backend_cooldown_ms_ = 10000;
+    static constexpr std::size_t backend_connection_limit_ = 16;
+    static constexpr long long backend_idle_timeout_ms_ = 15000;
 
 private:
     // ---- 私有函数 ----
@@ -150,7 +166,11 @@ private:
         bool backend_failure = false
     );
 
+    int take_idle_upstream(BackendPool& pool);
+    void release_upstream(int fd, bool reusable);
     void close_upstream(int fd);
+    void discard_idle_upstreams(BackendPool& pool);
+    void sweep_idle_upstreams(long long now);
 
 private:
     // ---- 私有变量 ----
@@ -166,6 +186,7 @@ private:
 
     std::unordered_map<int, Connection> connections_;
     std::unordered_map<int, Upstream> upstreams_;
+    std::unordered_map<std::string, BackendPool> backend_pools_;
 
     // 每条 location 规则下一次轮询的位置
     std::unordered_map<std::string, std::size_t> next_backend_;

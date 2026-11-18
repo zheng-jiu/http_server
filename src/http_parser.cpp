@@ -27,11 +27,23 @@ std::string lower(std::string value) {
 } // namespace
 
 bool HttpRequest::keep_alive() const {
-    const std::string connection = lower(header("Connection"));
-    if (version == "HTTP/1.1") {
-        return connection != "close";
+    std::istringstream options(header("Connection"));
+    std::string token;
+    bool keep_alive = false;
+
+    while (std::getline(options, token, ',')) {
+        token = lower(trim(token));
+
+        if (token == "close") {
+            return false;
+        }
+
+        if (token == "keep-alive") {
+            keep_alive = true;
+        }
     }
-    return connection == "keep-alive";
+
+    return version == "HTTP/1.1" || keep_alive;
 }
 
 std::string HttpRequest::header(const std::string& key) const {
@@ -81,6 +93,15 @@ bool HttpParser::parse_header_line(const std::string& line, HttpRequest& request
         error = "duplicate Content-Length";
         return false;
     }
+    if (key == "connection") {
+        auto it = request.headers.find(key);
+
+        if (it != request.headers.end()) {
+            it->second += "," + value;
+            return true;
+        }
+    }
+
     request.headers[key] = value;
     return true;
 }
