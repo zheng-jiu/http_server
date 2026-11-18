@@ -4,7 +4,9 @@
 #include <cctype>
 #include <sstream>
 #include <charconv>
+#include <string_view>
 #include <system_error>
+#include <utility>
 
 namespace tiny_http {
 
@@ -85,15 +87,16 @@ bool HttpParser::parse_header_line(const std::string& line, HttpRequest& request
         error = "empty header key";
         return false;
     }
-    if (key == "transfer-encoding") {
-        error = "Transfer-Encoding is not supported";
+    if (key == "transfer-encoding" &&
+        (lower(value) != "chunked" || request.headers.contains(key))) {
+        error = "unsupported or duplicate Transfer-Encoding";
         return false;
     }
     if (key == "content-length" && request.headers.find(key) != request.headers.end()) {
         error = "duplicate Content-Length";
         return false;
     }
-    if (key == "connection") {
+    if (key == "connection" || key == "expect") {
         auto it = request.headers.find(key);
 
         if (it != request.headers.end()) {
@@ -106,7 +109,10 @@ bool HttpParser::parse_header_line(const std::string& line, HttpRequest& request
     return true;
 }
 
-ParseResult HttpParser::parse(const std::string& buffer) const {
+ParseResult HttpParser::parse(
+    const std::string& buffer,
+    ChunkDecoder* chunks) const
+{
     ParseResult result;
     const std::size_t header_end = buffer.find("\r\n\r\n");
     if (header_end == std::string::npos) {
@@ -152,7 +158,52 @@ ParseResult HttpParser::parse(const std::string& buffer) const {
         }
     }
 
-    std::size_t body_start = header_end + 4;
+    const std::size_t body_start = header_end + 4;
+    auto& request = result.request;
+    const bool chunked = request.headers.contains("transfer-encoding");
+
+    if (chunked && (request.version != "HTTP/1.1" ||
+                    request.headers.contains("content-length"))) {
+        result.status = ParseStatus::BadRequest;
+        result.error = "invalid chunked request framing";
+        return result;
+    }
+
+    if (request.headers.contains("expect")) {
+        if (lower(request.header("Expect")) != "100-continue") {
+            result.status = ParseStatus::ExpectationFailed;
+            return result;
+        }
+
+        result.wants_continue = request.version == "HTTP/1.1";
+    }
+
+    if (chunked) {
+        ChunkDecoder local;
+        ChunkDecoder& decoder = chunks ? *chunks : local;
+
+        result.status = decoder.read(
+            std::string_view(buffer).substr(body_start),
+            max_body_size_
+        );
+
+        if (result.status == ParseStatus::Complete) {
+            result.consumed = body_start + decoder.used;
+            request.body = std::move(decoder.body);
+
+            request.headers.erase("transfer-encoding");
+            request.headers.erase("trailer");
+            request.headers["content-length"] =
+                std::to_string(request.body.size());
+
+            decoder = ChunkDecoder{};
+        } else if (result.status == ParseStatus::BadRequest) {
+            result.error = "invalid or oversized chunked body";
+        }
+
+        return result;
+    }
+
     std::size_t content_length = 0;
 
     const auto it = result.request.headers.find("content-length");

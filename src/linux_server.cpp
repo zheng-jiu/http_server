@@ -676,16 +676,44 @@ bool LinuxHttpServer::try_submit_next_request(int fd) {
         return true;
     }
 
-    const ParseResult parsed = parser_.parse(conn.in);
+    const ParseResult parsed = parser_.parse(conn.in, &conn.request_chunks);
 
     if (parsed.status == ParseStatus::Incomplete) {
+        if (parsed.wants_continue &&
+            conn.continue_state == ContinueState::None) {
+            conn.continue_state = ContinueState::Writing;
+            conn.processing = true;
+            conn.out = "HTTP/1.1 100 Continue\r\n\r\n";
+
+            switch_to_epollout(fd);
+            return false;
+        }
+
         return true;
     }
 
-    if (parsed.status == ParseStatus::BadRequest) {
-        close_connection(fd);
+    if (parsed.status != ParseStatus::Complete) {
+        const bool expect = parsed.status == ParseStatus::ExpectationFailed;
+
+        HttpResponse response(
+            expect ? 417 : 400,
+            expect ? "Expectation Failed" : "Bad Request"
+        );
+
+        response.set_body("");
+        response.set_keep_alive(false);
+
+        conn.out = response.serialize();
+        conn.in.clear();
+        conn.processing = true;
+        conn.rejecting = true;
+        conn.close_after_write = true;
+
+        switch_to_epollout(fd);
         return false;
     }
+
+    conn.continue_state = ContinueState::None;
 
     const LocationRule* location =
         match_location(parsed.request.target);
@@ -759,9 +787,13 @@ void LinuxHttpServer::handle_read(int fd)
 
     const std::size_t max_size = std::numeric_limits<std::size_t>::max();
 
-    const std::size_t input_limit = 
-        config_.max_body_size > max_size - 8192
-            ? max_size : config_.max_body_size + 8192;
+    constexpr std::size_t wire_overhead =
+        8192 + ChunkDecoder::metadata_limit;
+
+    const std::size_t input_limit =
+        config_.max_body_size > max_size - wire_overhead
+            ? max_size
+            : config_.max_body_size + wire_overhead;
 
     char buffer[4096];  // 临时接收缓冲区
 
@@ -846,6 +878,15 @@ void LinuxHttpServer::handle_write(int fd)
         std::cerr << "send() fd=" << fd << " 错误 errno=" << errno << "\n";
 
         close_connection(fd);
+        return;
+    }
+
+    if (conn.continue_state == ContinueState::Writing) {
+        conn.continue_state = ContinueState::Sent;
+        conn.processing = false;
+
+        switch_to_epollin(fd);
+        try_submit_next_request(fd);
         return;
     }
 

@@ -8,7 +8,8 @@ namespace tiny_http {
 enum class ParseStatus {
     Complete,
     Incomplete,
-    BadRequest
+    BadRequest,
+    ExpectationFailed
 };
 
 struct HttpRequest {
@@ -27,6 +28,7 @@ struct ParseResult {
     HttpRequest request;
     std::string error;
     std::size_t consumed{0};
+    bool wants_continue{false};
 };
 
 } // namespace tiny_http

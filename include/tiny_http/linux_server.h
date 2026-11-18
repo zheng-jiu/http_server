@@ -46,6 +46,8 @@ private:
         bool close_connection {false};
     };
 
+    enum class ContinueState { None, Writing, Sent };
+
     // 每个客户端连接的状态
     struct Connection {
         int fd {-1};
@@ -63,6 +65,8 @@ private:
         bool rejecting {false};
         long long last_active_ms {0};
         long long last_write_ms {0};
+        ChunkDecoder request_chunks {};
+        ContinueState continue_state {ContinueState::None};
         int upstream_fd {-1}; // 当前关联的后端 Socket
     };
 
@@ -84,6 +88,8 @@ private:
         std::size_t header_size {0};   // 0 表示响应头尚未解析
         std::optional<std::size_t> content_length;
         bool no_body {false};
+        bool chunked {false};
+        ChunkDecoder response_chunks {};
         int status {0};
         std::string response_head;    // 整理后的状态行和普通响应头
 

@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cctype>
 #include <sstream>
+#include <string_view>
 #include <system_error>
 #include <unordered_set>
 #include <utility>
@@ -226,7 +227,9 @@ void LinuxHttpServer::start_proxy(
     conn.close_after_write =
         request.version != "HTTP/1.1" || !request.keep_alive();
 
-    if (request.method != "GET" && request.method != "HEAD") {
+    if (request.method != "GET" &&
+        request.method != "HEAD" &&
+        request.method != "POST") {
         fail_proxy(client_fd, 405, "Method Not Allowed");
         return;
     }
@@ -305,7 +308,8 @@ void LinuxHttpServer::start_proxy(
 
     upstream.out += "Host: " + authority + "\r\n";
 
-    if (request.headers.contains("content-length") ||
+    if (request.method == "POST" ||
+        request.headers.contains("content-length") ||
         !request.body.empty()) {
         upstream.out += "Content-Length: "
                       + std::to_string(request.body.size()) + "\r\n";
@@ -442,7 +446,13 @@ bool LinuxHttpServer::parse_upstream_headers(Upstream& upstream)
         }
 
         if (name == "transfer-encoding") {
-            return false;
+            if (version != "HTTP/1.1" ||
+                upstream.chunked ||
+                lower_header(value) != "chunked") {
+                return false;
+            }
+
+            upstream.chunked = true;
         }
 
         if (name == "content-length") {
@@ -471,6 +481,11 @@ bool LinuxHttpServer::parse_upstream_headers(Upstream& upstream)
         }
 
         headers.emplace_back(std::move(name), std::move(value));
+    }
+
+    if (upstream.chunked &&
+        (upstream.content_length.has_value() || upstream.status == 204)) {
+        return false;
     }
 
     upstream.no_body =
@@ -608,7 +623,8 @@ void LinuxHttpServer::handle_upstream(
             );
 
             if (upstream.in.size() >
-                proxy_header_limit_ + proxy_body_limit_) {
+                proxy_header_limit_ + proxy_body_limit_ +
+                ChunkDecoder::metadata_limit) {
                 fail_proxy(client_fd, 502, "Bad Gateway");
                 return;
             }
@@ -637,6 +653,28 @@ void LinuxHttpServer::handle_upstream(
             const std::size_t received =
                 upstream.in.size() - upstream.header_size;
 
+            if (upstream.chunked && !upstream.no_body) {
+                const auto wire =
+                    std::string_view(upstream.in).substr(upstream.header_size);
+
+                auto& decoder = upstream.response_chunks;
+                const auto status = decoder.read(wire, proxy_body_limit_);
+
+                if (status == ParseStatus::BadRequest ||
+                    (status == ParseStatus::Complete &&
+                     decoder.used != wire.size())) {
+                    fail_proxy(client_fd, 502, "Bad Gateway");
+                    return;
+                }
+
+                if (status == ParseStatus::Complete) {
+                    finish_proxy(fd);
+                    return;
+                }
+
+                continue;
+            }
+
             if ((upstream.no_body && received != 0) ||
                 (!upstream.no_body && upstream.content_length.has_value() &&
                  received > *upstream.content_length)) {
@@ -662,6 +700,7 @@ void LinuxHttpServer::handle_upstream(
         if (n == 0) {
             // 无长度字段时，以后端正常关闭连接作为正文结束
             if (upstream.header_size > 0 &&
+                !upstream.chunked &&
                 !upstream.content_length.has_value()) {
                 finish_proxy(fd);
             } else {
@@ -707,6 +746,11 @@ void LinuxHttpServer::finish_proxy(int upstream_fd)
     }
 
     std::string response = upstream.response_head;
+
+    const std::string_view body = upstream.chunked
+        ? std::string_view(upstream.response_chunks.body)
+        : std::string_view(upstream.in).substr(upstream.header_size);
+
     std::size_t body_size = 0;
 
     if (upstream.no_body) {
@@ -718,9 +762,7 @@ void LinuxHttpServer::finish_proxy(int upstream_fd)
                       + "\r\n";
         }
     } else {
-        body_size = upstream.content_length.value_or(
-            upstream.in.size() - upstream.header_size
-        );
+        body_size = upstream.content_length.value_or(body.size());
 
         response += "Content-Length: "
                   + std::to_string(body_size)
@@ -731,16 +773,14 @@ void LinuxHttpServer::finish_proxy(int upstream_fd)
         ? "Connection: close\r\n\r\n"
         : "Connection: keep-alive\r\n\r\n";
 
-    response.append(
-        upstream.in,
-        upstream.header_size,
-        body_size
-    );
+    response.append(body.substr(0, body_size));
 
     client->second.out = std::move(response);
 
     const bool reusable = upstream.keep_alive &&
-        (upstream.no_body || upstream.content_length.has_value());
+        (upstream.no_body ||
+         upstream.content_length.has_value() ||
+         upstream.chunked);
 
     release_upstream(upstream_fd, reusable);
     switch_to_epollout(client_fd);
@@ -775,7 +815,7 @@ void LinuxHttpServer::fail_proxy(
     response.set_keep_alive(!it->second.close_after_write);
 
     if (status == 405) {
-        response.set_header("Allow", "GET, HEAD");
+        response.set_header("Allow", "GET, HEAD, POST");
     }
 
     it->second.out = response.serialize();
